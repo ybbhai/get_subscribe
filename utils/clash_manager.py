@@ -20,7 +20,11 @@ class ClashMetaManager:
             base_config = yaml.safe_load(f)
 
         base_config["proxies"] = proxies
-        base_config["proxy-groups"][0]["proxies"] = [p["name"] for p in proxies]
+        proxy_names = [p["name"] for p in proxies]
+        groups = base_config["proxy-groups"]
+        for group in groups:
+            group["proxies"].extend(proxy_names)
+        # base_config["proxy-groups"][0]["proxies"] = proxy_names
 
         with open(self.test, "w", encoding="utf-8") as f:
             yaml.safe_dump(base_config, f, allow_unicode=True)
@@ -43,7 +47,7 @@ class ClashMetaManager:
 
     def switch_proxy(self, proxy_name=None):
         r = requests.put(
-            f"{API}/proxies/TEST",
+            f"{API}/proxies/🔰 节点选择",
             json={"name": proxy_name},
             headers=HEADERS,
             timeout=3,

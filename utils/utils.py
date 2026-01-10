@@ -142,7 +142,7 @@ def test_proxy_telnet(proxy, timeout=8):
         s.close()
         return proxy
     except Exception as e:
-        print(e)
+        print("proxy ip and port test: ", e)
         return None
 
 
