@@ -201,6 +201,9 @@ if __name__ == '__main__':
 
     # 定时任务，每三小时执行一次，初次运行时也启动
     schedule.every(3).hours.do(main, env, dirs).run()
+    while True:
+        schedule.run_pending()
+        time.sleep(3)
     # dirs = './subscribe'
     # v2ray_2_clash(dirs + '/v2ray.txt')
 
