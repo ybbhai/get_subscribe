@@ -140,9 +140,10 @@ def test_proxy_telnet(proxy, timeout=8):
         s.settimeout(timeout)
         s.connect((proxy["server"], proxy["port"]))
         s.close()
+        print("proxy ip test success: ", proxy["server"], proxy["port"])
         return proxy
     except Exception as e:
-        print("proxy ip and port test: ", e)
+        print("proxy ip test failed: ", e)
         return None
 
 
