@@ -65,7 +65,11 @@ class ClashMetaManager:
             base_config = yaml.safe_load(f)
 
         base_config["proxies"] = proxies
-        base_config["proxy-groups"][0]["proxies"] = [p["name"] for p in proxies]
+        proxy_names = [p["name"] for p in proxies]
+        groups = base_config["proxy-groups"]
+        for group in groups:
+            group["proxies"].extend(proxy_names)
+        # base_config["proxy-groups"][0]["proxies"] = [p["name"] for p in proxies]
 
         with open(os.path.join(BIN_PATH, clash_name), "w", encoding="utf-8") as f:
             yaml.safe_dump(base_config, f, allow_unicode=True)
