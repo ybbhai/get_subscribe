@@ -179,7 +179,7 @@ def test_nodes(proxies, env, dirs):
         # traceback.print_exc()
     finally:
         manager.stop()
-        if env != "dev":
+        if env != "dev" and results:
             manager.clear_test()
             manager.save_config(results, os.path.join(dirs, "clash.yaml"))
 
