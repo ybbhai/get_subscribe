@@ -13,10 +13,11 @@ class ClashMetaManager:
     def __init__(self, base, test):
         self.base = os.path.join(BIN_PATH, base)
         self.test = os.path.join(BIN_PATH, test)
+        self.test_template = os.path.join(BIN_PATH, "test_template.yaml")
         self.proc = None
 
     def write_config(self, proxies, env=None, file_path=None):
-        with open(self.base, "r", encoding="utf-8") as f:
+        with open(self.test_template, "r", encoding="utf-8") as f:
             base_config = yaml.safe_load(f)
 
         if env and file_path and env == "prod" and os.path.exists(file_path):
@@ -26,10 +27,7 @@ class ClashMetaManager:
 
         base_config["proxies"] = proxies
         proxy_names = [p["name"] for p in proxies]
-        groups = base_config["proxy-groups"]
-        for group in groups:
-            group["proxies"].extend(proxy_names)
-        # base_config["proxy-groups"][0]["proxies"] = proxy_names
+        base_config["proxy-groups"][0]["proxies"] = proxy_names
 
         with open(self.test, "w", encoding="utf-8") as f:
             yaml.safe_dump(base_config, f, allow_unicode=True)
@@ -52,7 +50,7 @@ class ClashMetaManager:
 
     def switch_proxy(self, proxy_name=None):
         r = requests.put(
-            f"{API}/proxies/🔰 节点选择",
+            f"{API}/proxies/TEST",
             json={"name": proxy_name},
             headers=HEADERS,
             timeout=3,

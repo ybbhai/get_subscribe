@@ -151,7 +151,7 @@ def test_nodes(proxies, env, dirs):
     if not proxies:
         return
 
-    manager = ClashMetaManager('base_config.yaml', 'test_config.yaml')
+    manager = ClashMetaManager('base_template.yaml', 'test_config.yaml')
     manager.write_config(proxies, env=env, file_path=os.path.join(dirs, "clash.yaml"))
 
     manager.start()
