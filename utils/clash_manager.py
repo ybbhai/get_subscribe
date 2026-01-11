@@ -15,9 +15,14 @@ class ClashMetaManager:
         self.test = os.path.join(BIN_PATH, test)
         self.proc = None
 
-    def write_config(self, proxies):
+    def write_config(self, proxies, env=None, file_path=None):
         with open(self.base, "r", encoding="utf-8") as f:
             base_config = yaml.safe_load(f)
+
+        if env and file_path and env == "prod" and os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                test_config = yaml.safe_load(f)
+            proxies.extend(test_config["proxies"])
 
         base_config["proxies"] = proxies
         proxy_names = [p["name"] for p in proxies]

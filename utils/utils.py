@@ -152,7 +152,7 @@ def test_nodes(proxies, env, dirs):
         return
 
     manager = ClashMetaManager('base_config.yaml', 'test_config.yaml')
-    manager.write_config(proxies)
+    manager.write_config(proxies, env=env, file_path=os.path.join(dirs, "clash.yaml"))
 
     manager.start()
     if os.name == "nt":
