@@ -132,7 +132,10 @@ def get_clash_proxies():
         "https://raw.githubusercontent.com/SnapdragonLee/SystemProxy/master/dist/clash_config.yaml",
         "https://gh-proxy.com/raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml",
         "https://anaer.github.io/Sub/clash.yaml",
-        "https://cdn.jsdelivr.net/gh/vxiaov/free_proxies@main/clash/clash.provider.yaml"
+        "https://cdn.jsdelivr.net/gh/vxiaov/free_proxies@main/clash/clash.provider.yaml",
+        "https://raw.githubusercontent.com/dongchengjie/airport/main/subs/merged/tested_within.yaml",
+        "https://raw.githubusercontent.com/aiboboxx/clashfree/main/clash.yml",
+        "https://raw.githubusercontent.com/anaer/Sub/main/clash.yaml"
     ]
     clash_proxies = {
         'http': 'http://127.0.0.1:7890',
