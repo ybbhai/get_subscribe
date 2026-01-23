@@ -1,8 +1,7 @@
 import argparse
 import os
-import os
 import re
-import sys
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -10,7 +9,6 @@ import feedparser
 import requests
 import schedule
 import yaml
-from matplotlib.style.core import available
 
 from utils.utils import test_nodes, v2ray_2_clash, SSLAdapter, clean_yaml_content, parse_special_clash, filter_proxies, \
     test_proxy_telnet
@@ -39,8 +37,26 @@ def get_subscribe_proxies():
     log_dir = "./log"
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
+    old_http = os.environ.get('HTTP_PROXY')
+    old_https = os.environ.get('HTTPS_PROXY')
 
-    rss = feedparser.parse('https://www.cfmem.com/feeds/posts/default?alt=rss')
+    os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7890'
+    os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7890'
+
+    try:
+        rss = feedparser.parse('https://www.cfmem.com/feeds/posts/default?alt=rss')
+    except:
+        return []
+    finally:
+        if old_http:
+            os.environ['HTTP_PROXY'] = old_http
+        else:
+            os.environ.pop('HTTP_PROXY', None)
+
+        if old_https:
+            os.environ['HTTPS_PROXY'] = old_https
+        else:
+            os.environ.pop('HTTPS_PROXY', None)
     entries = rss.get("entries")
     if not entries:
         write_log("更新失败！无法拉取原网站内容", "ERROR")
@@ -97,6 +113,10 @@ def get_clash_proxies():
         # "https://fastly.jsdelivr.net/gh/freenodes/freenodes@main/ClashPremiumFree.yaml",
         "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml"
     ]
+    clash_proxies = {
+        'http': 'http://127.0.0.1:7890',
+        'https': 'http://127.0.0.1:7890'
+    }
 
     proxies = []
     # 创建session并配置SSL适配器、超时、重试策略
@@ -113,7 +133,8 @@ def get_clash_proxies():
                               verify=False,
                               timeout=timeout,
                               headers={
-                                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
+                                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+                              proxies=clash_proxies)
             print("获取yaml文件结果: ", req)
             if req.status_code in ok_code:
                 content = req.content.decode("utf-8")
@@ -132,9 +153,37 @@ def get_clash_proxies():
     return proxies
 
 
+def start_proxies():
+    path = os.path.join(os.path.dirname(__file__), "clash")
+    exe = "linux-compatible" if os.name != "nt" else "windows-compatible.exe"
+    exe_path = os.path.join(path, exe)
+    proc = subprocess.Popen(
+        [exe_path, "-f", os.path.join(path, "proxy.yaml")],
+        stdout=open("clash.log", "w"),
+        stderr=subprocess.STDOUT,
+    )
+    time.sleep(20)
+    return proc
+
+
+def stop_proxies(proc):
+    if proc:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
 def main(env, dirs):
-    proxies = get_subscribe_proxies()
-    proxies.extend(get_clash_proxies())
+    proc = start_proxies()
+    proxies = []
+    try:
+        proxies.extend(get_subscribe_proxies())
+    except:
+        pass
+    try:
+        proxies.extend(get_clash_proxies())
+    except:
+        pass
+    stop_proxies(proc)
     proxies = filter_proxies(proxies)
     # 并发调用方法test_proxy_telnet测试proxies的连通性
     available_proxies = []
