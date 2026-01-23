@@ -111,7 +111,18 @@ def get_clash_proxies():
         "https://clashgithub.com/wp-content/uploads/rss/{stamp}.yml",
         "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/clash.yml",
         # "https://fastly.jsdelivr.net/gh/freenodes/freenodes@main/ClashPremiumFree.yaml",
-        "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml"
+        "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
+        "https://node.clashnode.cc/uploads/${year}/${month}/1-${stamp}.yaml",
+        "https://node.clashnode.cc/uploads/${year}/${month}/2-${stamp}.yaml",
+        "https://node.clashnode.cc/uploads/${year}/${month}/4-${stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/${year}/${month}/0-${stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/${year}/${month}/1-${stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/${year}/${month}/2-${stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/${year}/${month}/3-${stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/${year}/${month}/4-${stamp}.yaml",
+        "https://raw.githubusercontent.com/PuddinCat/BestClash/refs/heads/main/proxies.yaml",
+        "https://oss.oneclash.cc/${year}/${month}/${stamp}.yaml",
+        "https://yoyapai.com/mianfeijiedian/${stamp}-clash-vpn-mfjiedian-yoyapai.com.yaml"
     ]
     clash_proxies = {
         'http': 'http://127.0.0.1:7890',
