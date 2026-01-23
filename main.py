@@ -98,6 +98,7 @@ def get_subscribe_proxies():
 def get_clash_proxies():
     # 获取当前时间，并转换成yyyyMMdd格式的字符串
     now = time.localtime(time.time())
+    day = time.strftime('%d', now)
     year = time.strftime('%Y', now)
     month = time.strftime('%m', now)
     stamp = time.strftime('%Y%m%d', now)
@@ -122,7 +123,16 @@ def get_clash_proxies():
         "https://node.freeclashnode.com/uploads/${year}/${month}/4-${stamp}.yaml",
         "https://raw.githubusercontent.com/PuddinCat/BestClash/refs/heads/main/proxies.yaml",
         "https://oss.oneclash.cc/${year}/${month}/${stamp}.yaml",
-        "https://yoyapai.com/mianfeijiedian/${stamp}-clash-vpn-mfjiedian-yoyapai.com.yaml"
+        "https://yoyapai.com/mianfeijiedian/${stamp}-clash-vpn-mfjiedian-yoyapai.com.yaml",
+        "https://node.nodeclash.com/uploads/${year}/${month}/0-${stamp}.yaml",
+        "https://node.nodeclash.com/uploads/${year}/${month}/1-${stamp}.yaml",
+        "https://node.nodeclash.com/uploads/${year}/${month}/3-${stamp}.yaml",
+        "https://github.com/free-nodes/clashfree/blob/main/clash${stamp}.yml",
+        "https://mm.mibei77.com/${stamp}/${month}.{day}Clashopl.yaml",
+        "https://raw.githubusercontent.com/SnapdragonLee/SystemProxy/master/dist/clash_config.yaml",
+        "https://gh-proxy.com/raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml",
+        "https://anaer.github.io/Sub/clash.yaml",
+        "https://cdn.jsdelivr.net/gh/vxiaov/free_proxies@main/clash/clash.provider.yaml"
     ]
     clash_proxies = {
         'http': 'http://127.0.0.1:7890',
@@ -136,7 +146,7 @@ def get_clash_proxies():
     # 设置超时时间（连接超时5秒，读取超时10秒）
     timeout = (5, 10)
     for url in urls:
-        url = url.format(stamp=stamp, year=year, month=month)
+        url = url.format(stamp=stamp, year=year, month=month, day=day)
         # 获取链接文件内容
         content = None
         try:
