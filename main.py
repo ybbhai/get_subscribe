@@ -113,22 +113,22 @@ def get_clash_proxies():
         "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/clash.yml",
         # "https://fastly.jsdelivr.net/gh/freenodes/freenodes@main/ClashPremiumFree.yaml",
         "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
-        "https://node.clashnode.cc/uploads/${year}/${month}/1-${stamp}.yaml",
-        "https://node.clashnode.cc/uploads/${year}/${month}/2-${stamp}.yaml",
-        "https://node.clashnode.cc/uploads/${year}/${month}/4-${stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/${year}/${month}/0-${stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/${year}/${month}/1-${stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/${year}/${month}/2-${stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/${year}/${month}/3-${stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/${year}/${month}/4-${stamp}.yaml",
+        "https://node.clashnode.cc/uploads/{year}/{month}/1-{stamp}.yaml",
+        "https://node.clashnode.cc/uploads/{year}/{month}/2-{stamp}.yaml",
+        "https://node.clashnode.cc/uploads/{year}/{month}/4-{stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/{year}/{month}/0-{stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/{year}/{month}/1-{stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/{year}/{month}/2-{stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/{year}/{month}/3-{stamp}.yaml",
+        "https://node.freeclashnode.com/uploads/{year}/{month}/4-{stamp}.yaml",
         "https://raw.githubusercontent.com/PuddinCat/BestClash/refs/heads/main/proxies.yaml",
-        "https://oss.oneclash.cc/${year}/${month}/${stamp}.yaml",
-        "https://yoyapai.com/mianfeijiedian/${stamp}-clash-vpn-mfjiedian-yoyapai.com.yaml",
-        "https://node.nodeclash.com/uploads/${year}/${month}/0-${stamp}.yaml",
-        "https://node.nodeclash.com/uploads/${year}/${month}/1-${stamp}.yaml",
-        "https://node.nodeclash.com/uploads/${year}/${month}/3-${stamp}.yaml",
-        "https://github.com/free-nodes/clashfree/blob/main/clash${stamp}.yml",
-        "https://mm.mibei77.com/${stamp}/${month}.{day}Clashopl.yaml",
+        "https://oss.oneclash.cc/{year}/{month}/{stamp}.yaml",
+        "https://yoyapai.com/mianfeijiedian/{stamp}-clash-vpn-mfjiedian-yoyapai.com.yaml",
+        "https://node.nodeclash.com/uploads/{year}/{month}/0-{stamp}.yaml",
+        "https://node.nodeclash.com/uploads/{year}/{month}/1-{stamp}.yaml",
+        "https://node.nodeclash.com/uploads/{year}/{month}/3-{stamp}.yaml",
+        "https://github.com/free-nodes/clashfree/blob/main/clash{stamp}.yml",
+        "https://mm.mibei77.com/{stamp}/{month}.{day}Clashopl.yaml",
         "https://raw.githubusercontent.com/SnapdragonLee/SystemProxy/master/dist/clash_config.yaml",
         "https://gh-proxy.com/raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml",
         "https://anaer.github.io/Sub/clash.yaml",
@@ -220,7 +220,7 @@ def main(env, dirs):
     # 测试proxies的可用性
     if available_proxies:
         available_proxies = test_nodes(available_proxies, env, dirs)
-    print("可用代理: ", len(available_proxies))
+    print("available proxies length: ", len(available_proxies))
 
 
 def parse_command_args():
