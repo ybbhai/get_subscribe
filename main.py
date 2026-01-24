@@ -128,7 +128,7 @@ def get_clash_proxies():
         "https://node.nodeclash.com/uploads/{year}/{month}/1-{stamp}.yaml",
         "https://node.nodeclash.com/uploads/{year}/{month}/3-{stamp}.yaml",
         "https://github.com/free-nodes/clashfree/blob/main/clash{stamp}.yml",
-        "https://mm.mibei77.com/{stamp}/{month}.{day}Clashopl.yaml",
+        "https://mm.mibei77.com/{year}{month}/{month}.{day}Clasholr.yaml",
         "https://raw.githubusercontent.com/SnapdragonLee/SystemProxy/master/dist/clash_config.yaml",
         "https://gh-proxy.com/raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml",
         "https://anaer.github.io/Sub/clash.yaml",
