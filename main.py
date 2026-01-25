@@ -131,11 +131,10 @@ def get_clash_proxies():
         "https://mm.mibei77.com/{year}{month}/{month}.{day}Clasholr.yaml",
         "https://raw.githubusercontent.com/SnapdragonLee/SystemProxy/master/dist/clash_config.yaml",
         "https://gh-proxy.com/raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml",
-        "https://anaer.github.io/Sub/clash.yaml",
         "https://cdn.jsdelivr.net/gh/vxiaov/free_proxies@main/clash/clash.provider.yaml",
         "https://raw.githubusercontent.com/dongchengjie/airport/main/subs/merged/tested_within.yaml",
         "https://raw.githubusercontent.com/aiboboxx/clashfree/main/clash.yml",
-        "https://raw.githubusercontent.com/anaer/Sub/main/clash.yaml"
+        "https://anaer.github.io/Sub/proxies.yaml"
     ]
     clash_proxies = {
         'http': 'http://127.0.0.1:7890',
@@ -145,6 +144,7 @@ def get_clash_proxies():
     proxies = []
     # 创建session并配置SSL适配器、超时、重试策略
     session = requests.Session()
+    session.proxies = clash_proxies
     session.mount("https://", SSLAdapter())
     # 设置超时时间（连接超时5秒，读取超时10秒）
     timeout = (5, 10)
@@ -157,8 +157,7 @@ def get_clash_proxies():
                               verify=False,
                               timeout=timeout,
                               headers={
-                                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-                              proxies=clash_proxies)
+                                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
             print("获取yaml文件结果: ", req)
             if req.status_code in ok_code:
                 content = req.content.decode("utf-8")

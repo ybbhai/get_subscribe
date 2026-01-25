@@ -117,13 +117,13 @@ def decode_hysteria2(link):
 
 def test_proxy_alive(socks_port, timeout=8):
     proxies = {
-        "http": "socks5h://127.0.0.1:7891",
-        "https": "socks5h://127.0.0.1:7891",
+        "http": "socks5h://127.0.0.1:7890",
+        "https": "socks5h://127.0.0.1:7890",
     }
 
     try:
         r = requests.get(
-            "https://www.cloudflare.com/cdn-cgi/trace",
+            "https://tv.youtube.com/welcome",
             proxies=proxies,
             timeout=timeout,
         )
