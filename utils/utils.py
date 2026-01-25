@@ -196,7 +196,7 @@ def test_proxy_alive(socks_port, timeout=8):
     links = [
         "https://www.google.com",
         "https://tv.youtube.com/welcome",
-        "https://chatgpt.com"
+        "https://github.com"
     ]
 
     print("开始并发测试链接...")
@@ -253,6 +253,8 @@ def test_nodes(proxies, env, dirs):
 
     results = []
     try:
+        count = 1
+        alive_count = 0
         for node in proxies:
             name = node["name"]
             print(f"Testing: {name}")
@@ -262,9 +264,11 @@ def test_nodes(proxies, env, dirs):
 
             alive = test_proxy_alive(7891, timeout=6)
             if alive:
+                alive_count += 1
                 results.append(node)
 
-            print(f" → {name}: {'OK' if alive else 'FAIL'}")
+            print(f" → {name}: {'OK' if alive else 'FAIL'}. {count} / {len(proxies)}. proxies: {alive_count}")
+            count += 1
     except Exception as e:
         print("Error during testing:", e)
         # traceback.print_exc()
