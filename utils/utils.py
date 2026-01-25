@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import os
@@ -6,7 +7,9 @@ import socket
 import ssl
 import time
 import urllib.parse
+from typing import Optional, Tuple, List
 
+import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
@@ -115,23 +118,111 @@ def decode_hysteria2(link):
     }
 
 
+def test_link(link, proxies, timeout=10):
+    try:
+        r = requests.get(
+            link,
+            proxies=proxies,
+            timeout=timeout,
+        )
+        print("test success: ", r)
+        return True
+    except Exception as e:
+        print(e)
+        # traceback.print_exc()
+        return False
+
+
+async def test_link_async(
+        session: aiohttp.ClientSession,
+        link: str,
+        proxies: Optional[dict] = None,
+        timeout: int = 10
+) -> Tuple[str, bool, float]:
+    """
+    异步测试链接
+    返回: (链接, 是否成功, 耗时)
+    """
+    start_time = time.time()
+    try:
+        async with session.get(
+                link,
+                proxy=proxies.get('http') if proxies else None,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as response:
+            # 可以根据状态码判断成功与否
+            success = response.status < 400
+            elapsed = time.time() - start_time
+            print(f"test success: {link} - Status: {response.status}")
+            return link, success, elapsed
+    except asyncio.TimeoutError:
+        elapsed = time.time() - start_time
+        print(f"Timeout: {link} - Timeout after {timeout}s")
+        return link, False, elapsed
+    except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"Error testing {link}: {str(e)}")
+        return link, False, elapsed
+
+
+async def test_links_concurrent(
+        links: List[str],
+        proxies: Optional[dict] = None,
+        timeout: int = 10,
+        max_concurrent: int = 10
+) -> List[Tuple[str, bool, float]]:
+    """
+    并发测试多个链接
+    """
+    # 创建连接池
+    connector = aiohttp.TCPConnector(limit=max_concurrent, ssl=False)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = []
+        for link in links:
+            task = test_link_async(session, link, proxies, timeout)
+            tasks.append(task)
+
+        # 并发执行所有任务
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        return results
+
+
 def test_proxy_alive(socks_port, timeout=8):
     proxies = {
         "http": "socks5h://127.0.0.1:7890",
         "https": "socks5h://127.0.0.1:7890",
     }
+    links = [
+        "https://www.google.com",
+        "https://tv.youtube.com/welcome",
+        "https://chatgpt.com"
+    ]
 
-    try:
-        r = requests.get(
-            "https://tv.youtube.com/welcome",
-            proxies=proxies,
-            timeout=timeout,
-        )
-        return "ip=" in r.text
-    except Exception as e:
-        print(e)
-        # traceback.print_exc()
-        return False
+    print("开始并发测试链接...")
+    start_time = time.time()
+    # 多线程并发调用test_link方法，并获取结果
+    # 并发测试链接
+    results = asyncio.run(test_links_concurrent(
+        links=links,
+        proxies=proxies,
+        timeout=timeout,
+        max_concurrent=5
+    ))
+    # 打印结果
+    total_time = time.time() - start_time
+    print(f"\n测试完成，总耗时: {total_time:.2f}秒")
+    print("=" * 50)
+
+    success_count = sum(1 for _, success, _ in results if success)
+    print(f"成功: {success_count}/{len(results)}")
+    print(f"失败: {len(results) - success_count}/{len(results)}")
+    print("\n详细结果:")
+    # 判断results是否都为False
+    for link, success, elapsed in results:
+        status = "✅ 成功" if success else "❌ 失败"
+        print(f"{status} | {elapsed:.2f}s | {link}")
+    return success_count == len(links)
 
 
 def test_proxy_telnet(proxy, timeout=8):
@@ -186,7 +277,7 @@ def test_nodes(proxies, env, dirs):
     return results
 
 
-def v2ray_2_clash(file_path = None, content = None):
+def v2ray_2_clash(file_path=None, content=None):
     nodes = None
     if file_path and os.path.exists(file_path):
         with open(file_path, encoding="utf-8") as f:
@@ -277,11 +368,11 @@ def parse_proxy_line(line):
 
     # 2. 修复name字段异常引号（IPv6+emoji场景）
     line = re.sub(r'(name:\s*)([^,}]+)"([^,}]+)', r'\1\2\3', line)  # 移除孤立引号
-    line = re.sub(r'(name:\s*)"([^,}]+)"', r'\1\2', line)           # 移除首尾引号
+    line = re.sub(r'(name:\s*)"([^,}]+)"', r'\1\2', line)  # 移除首尾引号
 
     # 3. 标准化IPv6地址（仅清理，不添加引号，避免JSON冲突）
     line = re.sub(r'(server:\s*)"([0-9a-fA-F:]+)"', r'\1\2', line)  # 移除IPv6多余引号
-    line = re.sub(r'(Host:\s*)"([0-9a-fA-F:]+)"', r'\1\2', line)    # ws-headers内IPv6
+    line = re.sub(r'(Host:\s*)"([0-9a-fA-F:]+)"', r'\1\2', line)  # ws-headers内IPv6
 
     # 4. 补全语法闭合符（解决<stream end>报错）
     open_brace = line.count("{")
@@ -291,7 +382,7 @@ def parse_proxy_line(line):
 
     # 5. 清理特殊字段的多余符号
     line = re.sub(r',\s*}', r'}', line)  # 移除末尾多余逗号
-    line = re.sub(r'\s+', ' ', line)     # 合并多空格
+    line = re.sub(r'\s+', ' ', line)  # 合并多空格
 
     return line
 
@@ -385,7 +476,7 @@ def parse_special_clash(content):
         if proxy:
             proxies.append(proxy)
         else:
-            print(f"⚠️  第{idx+1}行解析失败（内容为空）：{line}...")
+            print(f"⚠️  第{idx + 1}行解析失败（内容为空）：{line}...")
 
     return proxies
 
