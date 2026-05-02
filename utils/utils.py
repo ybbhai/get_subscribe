@@ -7,7 +7,7 @@ import socket
 import ssl
 import time
 import urllib.parse
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any
 
 import aiohttp
 import requests
@@ -170,7 +170,7 @@ async def test_links_concurrent(
         proxies: Optional[dict] = None,
         timeout: int = 10,
         max_concurrent: int = 10
-) -> List[Tuple[str, bool, float]]:
+) -> tuple[BaseException | Any, BaseException | Any, BaseException | Any, BaseException | Any, BaseException | Any]:
     """
     并发测试多个链接
     """
@@ -238,7 +238,7 @@ def test_proxy_telnet(proxy, timeout=8):
         return None
 
 
-def test_nodes(proxies, env, dirs):
+def test_nodes(proxies, env, dirs, timeout=6):
     if not proxies:
         return
 
@@ -255,6 +255,7 @@ def test_nodes(proxies, env, dirs):
     try:
         count = 1
         alive_count = 0
+        total = 100
         for node in proxies:
             name = node["name"]
             print(f"Testing: {name}")
@@ -262,10 +263,13 @@ def test_nodes(proxies, env, dirs):
             manager.switch_proxy(proxy_name=name)
             time.sleep(5)
 
-            alive = test_proxy_alive(7891, timeout=6)
+            alive = test_proxy_alive(7891, timeout=timeout)
             if alive:
                 alive_count += 1
                 results.append(node)
+                if alive_count >= total:
+                    print(f"Reached total alive count: {alive_count}. Stopping tests.")
+                    break
 
             print(f" → {name}: {'OK' if alive else 'FAIL'}. {count} / {len(proxies)}. proxies: {alive_count}")
             count += 1

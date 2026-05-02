@@ -4,6 +4,7 @@ import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
 import feedparser
 import requests
@@ -210,15 +211,20 @@ def main(env, dirs):
     proxies = filter_proxies(proxies)
     # 并发调用方法test_proxy_telnet测试proxies的连通性
     available_proxies = []
+    timeout = 5
+    if len(proxies) > 1000:
+        timeout = 2
+    elif len(proxies) > 500:
+        timeout = 4
     with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(test_proxy_telnet, proxies))
+        results = list(executor.map(partial(test_proxy_telnet, timeout=timeout), proxies))
         # print(results)
         for i, result in enumerate(results):
             if result:
                 available_proxies.append(proxies[i])
     # 测试proxies的可用性
     if available_proxies:
-        available_proxies = test_nodes(available_proxies, env, dirs)
+        available_proxies = test_nodes(available_proxies, env, dirs, timeout)
     print("available proxies length: ", len(available_proxies))
 
 
@@ -271,13 +277,14 @@ if __name__ == '__main__':
     if "directory" in args and args["directory"]:
         dirs = args["directory"]
 
-    # 定时任务，每三小时执行一次，初次运行时也启动
-    schedule.every(3).hours.do(main, env, dirs).run()
-    while True:
-        schedule.run_pending()
-        time.sleep(3)
+    # # 定时任务，每三小时执行一次，初次运行时也启动
+    # schedule.every(3).hours.do(main, env, dirs).run()
+    # while True:
+    #     schedule.run_pending()
+    #     time.sleep(3)
     # dirs = './subscribe'
     # v2ray_2_clash(dirs + '/v2ray.txt')
+    main(env, dirs)
 
     # get_clash_proxies()
 
