@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import concurrent.futures
 import json
 import os
 import re
@@ -190,8 +191,8 @@ async def test_links_concurrent(
 
 def test_proxy_alive(socks_port, timeout=8):
     proxies = {
-        "http": "socks5h://127.0.0.1:7890",
-        "https": "socks5h://127.0.0.1:7890",
+        "http": f"http://127.0.0.1:{socks_port}",
+        "https": f"http://127.0.0.1:{socks_port}",
     }
     links = [
         "https://www.google.com",
@@ -238,49 +239,82 @@ def test_proxy_telnet(proxy, timeout=8):
         return None
 
 
-def test_nodes(proxies, env, dirs, timeout=6):
-    if not proxies:
-        return
+def _test_single_node(node, env, dirs, timeout, worker_id):
+    http_port = 7890 + worker_id * 10
+    socks_port = http_port + 1
+    controller_port = 9090 + worker_id
+    config_name = f"clash_test_{worker_id}.yaml"
+    log_name = f"clash_test_{worker_id}.log"
+    config_path = os.path.join(dirs, config_name)
+    log_path = os.path.join(dirs, log_name)
 
-    manager = ClashMetaManager('base_template.yaml', 'test_config.yaml')
-    manager.write_config(proxies, env=env, file_path=os.path.join(dirs, "clash.yaml"))
+    manager = ClashMetaManager(
+        'base_template.yaml',
+        config_name,
+        controller_port=controller_port,
+        http_port=http_port,
+        socks_port=socks_port,
+        log_file=log_path,
+    )
 
-    manager.start()
-    if os.name == "nt":
-        print("windows")
-    else:
-        print("linux")
-
-    results = []
     try:
-        count = 1
-        alive_count = 0
-        total = 100
-        for node in proxies:
-            name = node["name"]
-            print(f"Testing: {name}")
-
-            manager.switch_proxy(proxy_name=name)
-            time.sleep(5)
-
-            alive = test_proxy_alive(7891, timeout=timeout)
-            if alive:
-                alive_count += 1
-                results.append(node)
-                if alive_count >= total:
-                    print(f"Reached total alive count: {alive_count}. Stopping tests.")
-                    break
-
-            print(f" → {name}: {'OK' if alive else 'FAIL'}. {count} / {len(proxies)}. proxies: {alive_count}")
-            count += 1
+        manager.write_config([node], env=env, output_path=config_path)
+        manager.start(config_path=config_path)
+        alive = test_proxy_alive(http_port, timeout=timeout)
+        return node if alive else None
     except Exception as e:
-        print("Error during testing:", e)
-        # traceback.print_exc()
+        print(f"Batch test failed for {node.get('name', 'unknown')}: {e}")
+        return None
     finally:
         manager.stop()
-        if env != "dev" and results:
-            manager.clear_test()
-            manager.save_config(results, os.path.join(dirs, "clash.yaml"))
+        for path in (config_path, log_path):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+
+def test_nodes(proxies, env, dirs, timeout=6):
+    if not proxies:
+        return []
+
+    print("开始批量测试节点（并发启动多个 Clash 实例）...")
+    start_time = time.time()
+
+    worker_count = min(8, len(proxies))
+    results = []
+
+    count = 0
+    for batch_start in range(0, len(proxies), worker_count):
+        batch = proxies[batch_start:batch_start + worker_count]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            future_map = {
+                executor.submit(_test_single_node, node, env, dirs, timeout, slot): node
+                for slot, node in enumerate(batch)
+            }
+
+            for future in concurrent.futures.as_completed(future_map):
+                node = future_map[future]
+                try:
+                    count += 1
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                        print(f" → {node['name']}: OK")
+                    else:
+                        print(f" → {node['name']}: FAIL")
+                except Exception as e:
+                    print(f" → {node['name']}: FAIL ({e})")
+                print(f"已测试 {count}/{len(proxies)} 个节点，可用节点: {len(results)}")
+
+    total_time = time.time() - start_time
+    print(f"批量测试完成，总耗时: {total_time:.2f}秒")
+    print(f"成功节点: {len(results)}/{len(proxies)}")
+
+    if env != "dev" and results:
+        manager = ClashMetaManager('base_template.yaml', 'test_config.yaml')
+        manager.save_config(results, os.path.join(dirs, "clash.yaml"))
 
     return results
 
