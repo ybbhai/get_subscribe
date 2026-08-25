@@ -37,6 +37,24 @@ proxy-groups:
       - 🔰 节点选择
       - ♻️ 自动选择
       - 🎯 全球直连
+  - name: 🌐 Google
+    type: select
+    proxies:
+      - 🔰 节点选择
+      - ♻️ 自动选择
+      - 🎯 全球直连
+  - name: 📺 YouTube
+    type: select
+    proxies:
+      - 🔰 节点选择
+      - ♻️ 自动选择
+      - 🎯 全球直连
+  - name: 💬 ChatGPT
+    type: select
+    proxies:
+      - 🔰 节点选择
+      - ♻️ 自动选择
+      - 🎯 全球直连
   - name: ⛔️ 广告拦截
     type: select
     proxies:
@@ -102,7 +120,21 @@ rules:
   - IP-CIDR6,fc00::/7,🎯 全球直连,no-resolve
   - IP-CIDR6,fe80::/10,🎯 全球直连,no-resolve
   - IP-CIDR6,fd00::/8,🎯 全球直连,no-resolve
-  - DOMAIN-KEYWORD,1drv,Ⓜ️ 微软服务
+  - DOMAIN-KEYWORD,google,🌐 Google
+  - DOMAIN-SUFFIX,google.com,🌐 Google
+  - DOMAIN-SUFFIX,googleapis.com,🌐 Google
+  - DOMAIN-SUFFIX,googlevideo.com,🌐 Google
+  - DOMAIN-SUFFIX,gstatic.com,🌐 Google
+  - DOMAIN-SUFFIX,youtube.com,📺 YouTube
+  - DOMAIN-SUFFIX,youtubei.com,📺 YouTube
+  - DOMAIN-SUFFIX,ytimg.com,📺 YouTube
+  - DOMAIN-SUFFIX,y2u.be,📺 YouTube
+  - DOMAIN-SUFFIX,gvt1.com,📺 YouTube
+  - DOMAIN-KEYWORD,openai,💬 ChatGPT
+  - DOMAIN-SUFFIX,openai.com,💬 ChatGPT
+  - DOMAIN-SUFFIX,chatgpt.com,💬 ChatGPT
+  - DOMAIN-SUFFIX,anthropic.com,💬 ChatGPT
+  - DOMAIN-SUFFIX,oaiusercontent.com,💬 ChatGPT
   - DOMAIN-KEYWORD,microsoft,Ⓜ️ 微软服务
   - DOMAIN-SUFFIX,aadrm.com,Ⓜ️ 微软服务
   - DOMAIN-SUFFIX,acompli.com,Ⓜ️ 微软服务

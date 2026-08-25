@@ -1,10 +1,9 @@
 import argparse
+import asyncio
 import os
 import re
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 
 import feedparser
 import requests
@@ -12,7 +11,7 @@ import schedule
 import yaml
 
 from utils.utils import test_nodes, v2ray_2_clash, SSLAdapter, clean_yaml_content, parse_special_clash, filter_proxies, \
-    test_proxy_telnet
+    test_proxy_telnet, test_proxies_async
 
 requests.packages.urllib3.disable_warnings()
 
@@ -96,6 +95,17 @@ def get_subscribe_proxies():
     return proxies
 
 
+def load_urls(config_path):
+    """从配置文件读取URL列表，忽略注释行和空行"""
+    urls = []
+    with open(config_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                urls.append(line)
+    return urls
+
+
 def get_clash_proxies():
     # 获取当前时间，并转换成yyyyMMdd格式的字符串
     now = time.localtime(time.time())
@@ -104,39 +114,9 @@ def get_clash_proxies():
     month = time.strftime('%m', now)
     stamp = time.strftime('%Y%m%d', now)
 
-    urls = [
-        "https://free.datiya.com/uploads/{stamp}-clash.yaml",
-        "https://node.openclash.cc/uploads/{year}/{month}/2-{stamp}.yaml",
-        "https://node.openclash.cc/uploads/{year}/{month}/4-{stamp}.yaml",
-        # "https://oneclash.cc/wp-content/uploads/{year}/{month}/{stamp}.yaml",
-        "https://raw.githubusercontent.com/free-nodes/clashfree/refs/heads/main/clash{stamp}.yml",
-        "https://clashgithub.com/wp-content/uploads/rss/{stamp}.yml",
-        "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/clash.yml",
-        # "https://fastly.jsdelivr.net/gh/freenodes/freenodes@main/ClashPremiumFree.yaml",
-        "https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml",
-        "https://node.clashnode.cc/uploads/{year}/{month}/1-{stamp}.yaml",
-        "https://node.clashnode.cc/uploads/{year}/{month}/2-{stamp}.yaml",
-        "https://node.clashnode.cc/uploads/{year}/{month}/4-{stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/{year}/{month}/0-{stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/{year}/{month}/1-{stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/{year}/{month}/2-{stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/{year}/{month}/3-{stamp}.yaml",
-        "https://node.freeclashnode.com/uploads/{year}/{month}/4-{stamp}.yaml",
-        "https://raw.githubusercontent.com/PuddinCat/BestClash/refs/heads/main/proxies.yaml",
-        "https://oss.oneclash.cc/{year}/{month}/{stamp}.yaml",
-        "https://yoyapai.com/mianfeijiedian/{stamp}-clash-vpn-mfjiedian-yoyapai.com.yaml",
-        "https://node.nodeclash.com/uploads/{year}/{month}/0-{stamp}.yaml",
-        "https://node.nodeclash.com/uploads/{year}/{month}/1-{stamp}.yaml",
-        "https://node.nodeclash.com/uploads/{year}/{month}/3-{stamp}.yaml",
-        "https://github.com/free-nodes/clashfree/blob/main/clash{stamp}.yml",
-        "https://mm.mibei77.com/{year}{month}/{month}.{day}Clasholr.yaml",
-        "https://raw.githubusercontent.com/SnapdragonLee/SystemProxy/master/dist/clash_config.yaml",
-        "https://gh-proxy.com/raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml",
-        "https://cdn.jsdelivr.net/gh/vxiaov/free_proxies@main/clash/clash.provider.yaml",
-        "https://raw.githubusercontent.com/dongchengjie/airport/main/subs/merged/tested_within.yaml",
-        "https://raw.githubusercontent.com/aiboboxx/clashfree/main/clash.yml",
-        "https://anaer.github.io/Sub/proxies.yaml"
-    ]
+    # 从配置文件读取URL
+    config_path = os.path.join(os.path.dirname(__file__), 'config', 'urls.txt')
+    urls = load_urls(config_path)
     clash_proxies = {
         'http': 'http://127.0.0.1:7890',
         'https': 'http://127.0.0.1:7890'
@@ -209,20 +189,19 @@ def main(env, dirs):
         pass
     stop_proxies(proc)
     proxies = filter_proxies(proxies)
-    # 并发调用方法test_proxy_telnet测试proxies的连通性
-    available_proxies = []
+
+    # 异步 TCP 连通性测试（利用 Linux epoll）
     timeout = 5
     if len(proxies) > 1000:
         timeout = 2
     elif len(proxies) > 500:
         timeout = 4
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(partial(test_proxy_telnet, timeout=timeout), proxies))
-        # print(results)
-        for i, result in enumerate(results):
-            if result:
-                available_proxies.append(proxies[i])
-    # 测试proxies的可用性
+
+    print(f"开始异步 TCP 测试，共 {len(proxies)} 个节点...")
+    available_proxies = asyncio.run(test_proxies_async(proxies, timeout=timeout))
+    print(f"TCP 测试通过: {len(available_proxies)}/{len(proxies)} 个节点")
+
+    # 测试 proxies 的可用性
     if available_proxies:
         available_proxies = test_nodes(available_proxies, env, dirs, timeout)
     print("available proxies length: ", len(available_proxies))
@@ -278,13 +257,13 @@ if __name__ == '__main__':
         dirs = args["directory"]
 
     # # 定时任务，每三小时执行一次，初次运行时也启动
-    # schedule.every(3).hours.do(main, env, dirs).run()
-    # while True:
-    #     schedule.run_pending()
-    #     time.sleep(3)
+    schedule.every(3).hours.do(main, env, dirs).run()
+    while True:
+        schedule.run_pending()
+        time.sleep(3)
     # dirs = './subscribe'
     # v2ray_2_clash(dirs + '/v2ray.txt')
-    main(env, dirs)
+    # main(env, dirs)
 
     # get_clash_proxies()
 

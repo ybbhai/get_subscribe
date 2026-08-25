@@ -1,0 +1,35 @@
+# Clash Proxy URLs - one per line
+# Lines starting with # are comments and will be ignored
+# Placeholders: {stamp}, {year}, {month}, {day}
+
+https://free.datiya.com/uploads/{stamp}-clash.yaml
+https://node.openclash.cc/uploads/{year}/{month}/2-{stamp}.yaml
+https://node.openclash.cc/uploads/{year}/{month}/4-{stamp}.yaml
+# https://oneclash.cc/wp-content/uploads/{year}/{month}/{stamp}.yaml
+https://raw.githubusercontent.com/free-nodes/clashfree/refs/heads/main/clash{stamp}.yml
+https://clashgithub.com/wp-content/uploads/rss/{stamp}.yml
+https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/clash.yml
+# https://fastly.jsdelivr.net/gh/freenodes/freenodes@main/ClashPremiumFree.yaml
+https://raw.githubusercontent.com/mfuu/v2ray/master/clash.yaml
+https://node.clashnode.cc/uploads/{year}/{month}/1-{stamp}.yaml
+https://node.clashnode.cc/uploads/{year}/{month}/2-{stamp}.yaml
+https://node.clashnode.cc/uploads/{year}/{month}/4-{stamp}.yaml
+https://node.freeclashnode.com/uploads/{year}/{month}/0-{stamp}.yaml
+https://node.freeclashnode.com/uploads/{year}/{month}/1-{stamp}.yaml
+https://node.freeclashnode.com/uploads/{year}/{month}/2-{stamp}.yaml
+https://node.freeclashnode.com/uploads/{year}/{month}/3-{stamp}.yaml
+https://node.freeclashnode.com/uploads/{year}/{month}/4-{stamp}.yaml
+https://raw.githubusercontent.com/PuddinCat/BestClash/refs/heads/main/proxies.yaml
+https://oss.oneclash.cc/{year}/{month}/{stamp}.yaml
+https://yoyapai.com/mianfeijiedian/{stamp}-clash-vpn-mfjiedian-yoyapai.com.yaml
+https://node.nodeclash.com/uploads/{year}/{month}/0-{stamp}.yaml
+https://node.nodeclash.com/uploads/{year}/{month}/1-{stamp}.yaml
+https://node.nodeclash.com/uploads/{year}/{month}/3-{stamp}.yaml
+# https://github.com/free-nodes/clashfree/blob/main/clash{stamp}.yml
+https://mm.mibei77.com/{year}{month}/{month}.{day}Clasholr.yaml
+https://raw.githubusercontent.com/SnapdragonLee/SystemProxy/master/dist/clash_config.yaml
+https://gh-proxy.com/raw.githubusercontent.com/Ruk1ng001/freeSub/main/clash.yaml
+https://cdn.jsdelivr.net/gh/vxiaov/free_proxies@main/clash/clash.provider.yaml
+https://raw.githubusercontent.com/dongchengjie/airport/main/subs/merged/tested_within.yaml
+https://raw.githubusercontent.com/aiboboxx/clashfree/main/clash.yml
+https://anaer.github.io/Sub/proxies.yaml
