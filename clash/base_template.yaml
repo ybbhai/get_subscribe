@@ -38,23 +38,20 @@ proxy-groups:
       - ♻️ 自动选择
       - 🎯 全球直连
   - name: 🌐 Google
-    type: select
-    proxies:
-      - 🔰 节点选择
-      - ♻️ 自动选择
-      - 🎯 全球直连
+    type: url-test
+    url: https://www.google.com/generate_204
+    interval: 300
+    proxies: []
   - name: 📺 YouTube
-    type: select
-    proxies:
-      - 🔰 节点选择
-      - ♻️ 自动选择
-      - 🎯 全球直连
+    type: url-test
+    url: https://www.youtube.com
+    interval: 300
+    proxies: []
   - name: 💬 ChatGPT
-    type: select
-    proxies:
-      - 🔰 节点选择
-      - ♻️ 自动选择
-      - 🎯 全球直连
+    type: url-test
+    url: https://chatgpt.com
+    interval: 300
+    proxies: []
   - name: ⛔️ 广告拦截
     type: select
     proxies:

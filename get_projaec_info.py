@@ -23,16 +23,28 @@ def get_project_info(user, project, name, item, date_key, token=""):
     while True:
         page += 1
         url = f"https://api.github.com/repos/{user}/{project}/{item}?page={page}"
-        req = requests.get(url, headers=header)
+        req = requests.get(url, headers=header, timeout=20)
+        req.raise_for_status()
         datas = req.json()
+        if not isinstance(datas, list):
+            raise ValueError(f"GitHub API 返回了非列表数据: {url}")
         if not datas:
             break
-        data_list.extend([date_pat.match(i.get(date_key)).group() for i in datas])
+        for item_data in datas:
+            value = item_data.get(date_key) if isinstance(item_data, dict) else None
+            match = date_pat.match(value or "")
+            if match:
+                data_list.append(match.group())
+        if len(datas) < 30:
+            break
+
+    end_date = date.today()
+    if not data_list:
+        date_list = pd.date_range(end=end_date, periods=1)
+        return {"name": name, "num_list": [0], "date_list": date_list}
 
     date_dic = {}
-
     start_date = min(data_list)
-    end_date = date.today()
     for date_str in data_list:
         if not date_dic.get(date_str):
             date_dic[date_str] = 0
@@ -92,6 +104,7 @@ def create_svg(project, datas, save_path, theme=""):
     ax.grid(True, linestyle='-.')
 
     plt.savefig(save_path)
+    plt.close(fig)
 
 
 def main(user, project, save_path, theme="", token=""):

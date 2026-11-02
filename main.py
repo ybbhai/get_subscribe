@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 import os
 import re
 import subprocess
@@ -15,22 +16,33 @@ from utils.utils import test_nodes, v2ray_2_clash, SSLAdapter, clean_yaml_conten
 
 requests.packages.urllib3.disable_warnings()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 ok_code = [200, 201, 202, 203, 204, 205, 206]
 
 # 邮箱域名过滤列表
-blackhole_list = ["cnr.cn", "cyberpolice.cn", "gov.cn", "samr.gov.cn", "12321.cn"
-                                                                       "miit.gov.cn", "chinatcc.gov.cn"]
+blackhole_list = ["cnr.cn", "cyberpolice.cn", "gov.cn", "samr.gov.cn",
+                  "12321.cn", "miit.gov.cn", "chinatcc.gov.cn"]
 
 
 def write_log(content, level="INFO"):
+    """写入月度日志文件，同时输出到控制台"""
     date_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
-    update_log = f"[{date_str}] [{level}] {content}\n"
-    print(update_log)
-    with open(f'./log/{time.strftime("%Y-%m", time.localtime(time.time()))}-update.log', 'a', encoding="utf-8") as f:
-        f.write(update_log)
+    update_log = f"[{date_str}] [{level}] {content}"
+    logger.log(getattr(logging, level, logging.INFO), content)
+    log_dir = './log'
+    os.makedirs(log_dir, exist_ok=True)
+    with open(f'{log_dir}/{time.strftime("%Y-%m", time.localtime(time.time()))}-update.log', 'a',
+              encoding="utf-8") as f:
+        f.write(update_log + "\n")
 
 
-def get_subscribe_proxies():
+def get_subscribe_proxies(use_local_proxy=True):
     dirs = './subscribe'
     if not os.path.exists(dirs):
         os.makedirs(dirs)
@@ -40,58 +52,86 @@ def get_subscribe_proxies():
     old_http = os.environ.get('HTTP_PROXY')
     old_https = os.environ.get('HTTPS_PROXY')
 
-    os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7890'
-    os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7890'
+    if use_local_proxy:
+        os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7890'
+        os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7890'
 
+    rss = None
     try:
         rss = feedparser.parse('https://www.cfmem.com/feeds/posts/default?alt=rss')
-    except:
+    except Exception as e:
+        logger.error("拉取 RSS 失败: %s", e)
         return []
     finally:
-        if old_http:
-            os.environ['HTTP_PROXY'] = old_http
-        else:
-            os.environ.pop('HTTP_PROXY', None)
+        if use_local_proxy:
+            if old_http:
+                os.environ['HTTP_PROXY'] = old_http
+            else:
+                os.environ.pop('HTTP_PROXY', None)
 
-        if old_https:
-            os.environ['HTTPS_PROXY'] = old_https
-        else:
-            os.environ.pop('HTTPS_PROXY', None)
-    entries = rss.get("entries")
+            if old_https:
+                os.environ['HTTPS_PROXY'] = old_https
+            else:
+                os.environ.pop('HTTPS_PROXY', None)
+
+    # feedparser 对象用属性访问，不用 dict.get
+    entries = getattr(rss, "entries", []) if rss else []
     if not entries:
         write_log("更新失败！无法拉取原网站内容", "ERROR")
-        return
+        return []
     update_list = []
     summary = entries[0].get("summary")
     if not summary:
         write_log("暂时没有可用的订阅更新", "WARN")
-        return
+        return []
     v2ray_list = re.findall(r">V2Ray/XRay -&gt; (.*?)</span>", summary)
     proxies = []
     # 获取普通订阅链接
-    if any(v2ray_list):
-        v2ray_url = v2ray_list[-1].replace('amp;', '')
-        v2ray_req = requests.request("GET", v2ray_url, verify=False)
-        v2ray_code = v2ray_req.status_code
-        if v2ray_code not in ok_code:
-            write_log(f"获取 v2ray 订阅失败：{v2ray_url} - {v2ray_code}", "WARN")
+    if any(v2ray_list) and not v2ray_list[-1].startswith("订阅地址生成失败"):
+        v2ray_url = v2ray_list[-1].replace('&amp;', '&').strip()
+        # 只请求合法 URL，避免捕获到非 URL 文本
+        if not v2ray_url.startswith(("http://", "https://")):
+            logger.warning("v2ray 订阅 URL 无效，跳过: %s", v2ray_url[:80])
         else:
-            update_list.append(f"v2ray: {v2ray_code}")
-            proxies.extend(v2ray_2_clash(content=v2ray_req.text))
+            try:
+                v2ray_req = requests.get(v2ray_url, timeout=30)
+            except requests.exceptions.RequestException as e:
+                logger.error("请求 v2ray 订阅失败：%s", e)
+                return proxies
+            v2ray_code = v2ray_req.status_code
+            if v2ray_code not in ok_code:
+                write_log(f"获取 v2ray 订阅失败：{v2ray_url} - {v2ray_code}", "WARN")
+            else:
+                update_list.append(f"v2ray: {v2ray_code}")
+                proxies.extend(v2ray_2_clash(content=v2ray_req.text))
     clash_list = re.findall(r">clash -&gt; (.*?)</span>", summary)
     # 获取clash订阅链接
     if any(clash_list) and not clash_list[-1].startswith("订阅地址生成失败"):
-        clash_url = clash_list[-1].replace('amp;', '')
-        clash_req = requests.request("GET", clash_url, verify=False)
-        clash_code = clash_req.status_code
-        if clash_code not in ok_code:
-            write_log(f"获取 clash 订阅失败：{clash_url} - {clash_code}", "WARN")
+        clash_url = clash_list[-1].replace('&amp;', '&').strip()
+        # 只请求合法 URL，避免捕获到非 URL 文本
+        if not clash_url.startswith(("http://", "https://")):
+            logger.warning("clash 订阅 URL 无效，跳过: %s", clash_url[:80])
         else:
-            update_list.append(f"clash: {clash_code}")
-            clash_content = clash_req.content.decode("utf-8")
-            # 获取clash_content里的proxies
-            proxies.extend(yaml.safe_load(clash_content)["proxies"])
-    print("结果: ", update_list)
+            try:
+                clash_req = requests.get(clash_url, timeout=30)
+            except requests.exceptions.RequestException as e:
+                logger.error("请求 clash 订阅失败：%s", e)
+                return proxies
+            clash_code = clash_req.status_code
+            if clash_code not in ok_code:
+                write_log(f"获取 clash 订阅失败：{clash_url} - {clash_code}", "WARN")
+            else:
+                update_list.append(f"clash: {clash_code}")
+                clash_content = clash_req.content.decode("utf-8")
+                try:
+                    parsed = yaml.safe_load(clash_content)
+                    if parsed and "proxies" in parsed:
+                        proxies.extend(parsed["proxies"])
+                    else:
+                        logger.warning("clash 订阅内容中无 proxies 字段，跳过: %s", clash_url)
+                except yaml.YAMLError as e:
+                    logger.error("解析 clash 订阅 YAML 失败（%s）: %s", clash_url, e)
+    logger.info("RSS 订阅获取结果: %s，共 %d 个节点", update_list, len(proxies))
     return proxies
 
 
@@ -106,7 +146,7 @@ def load_urls(config_path):
     return urls
 
 
-def get_clash_proxies():
+def get_clash_proxies(use_local_proxy=True):
     # 获取当前时间，并转换成yyyyMMdd格式的字符串
     now = time.localtime(time.time())
     day = time.strftime('%d', now)
@@ -125,7 +165,8 @@ def get_clash_proxies():
     proxies = []
     # 创建session并配置SSL适配器、超时、重试策略
     session = requests.Session()
-    session.proxies = clash_proxies
+    if use_local_proxy:
+        session.proxies = clash_proxies
     session.mount("https://", SSLAdapter())
     # 设置超时时间（连接超时5秒，读取超时10秒）
     timeout = (5, 10)
@@ -133,62 +174,93 @@ def get_clash_proxies():
         url = url.format(stamp=stamp, year=year, month=month, day=day)
         # 获取链接文件内容
         content = None
+        raw_content = None
         try:
             req = session.get(url,
-                              verify=False,
                               timeout=timeout,
                               headers={
                                   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
-            print("获取yaml文件结果: ", req)
+            logger.debug("获取yaml文件结果: %s", req.status_code)
             if req.status_code in ok_code:
-                content = req.content.decode("utf-8")
-                content = clean_yaml_content(content)
-                content = yaml.safe_load(content)
-                proxies.extend(content["proxies"])
+                raw_content = req.content.decode("utf-8")
+                content = clean_yaml_content(raw_content)
+                parsed = yaml.safe_load(content)
+                if parsed and "proxies" in parsed:
+                    proxies.extend(parsed["proxies"])
+                else:
+                    logger.warning("URL %s 响应中无 proxies 字段，尝试特殊解析...", url)
+                    proxies.extend(parse_special_clash(content))
         except Exception as e:
-            if content:
+            if raw_content:
+                # yaml 解析失败时，尝试特殊解析
                 try:
-                    tmp = parse_special_clash(content)
-                    proxies.extend(tmp)
-                except Exception as e:
-                    print("获取proxy失败：", url, e)
+                    proxies.extend(parse_special_clash(raw_content))
+                except Exception as e2:
+                    logger.error("获取proxy失败（特殊解析也失败）：%s 原因：%s / %s", url, e, e2)
             else:
-                print("获取proxy失败：", url, e)
+                logger.error("获取proxy失败：%s 原因：%s", url, e)
     return proxies
 
 
 def start_proxies():
+    """
+    启动主 Clash 实例（用于订阅拉取时走本地代理）。
+    若二进制不存在或启动失败，返回 None，main() 中需做 if proc 保护。
+    """
     path = os.path.join(os.path.dirname(__file__), "clash")
     exe = "linux-compatible" if os.name != "nt" else "windows-compatible.exe"
     exe_path = os.path.join(path, exe)
-    proc = subprocess.Popen(
-        [exe_path, "-f", os.path.join(path, "proxy.yaml")],
-        stdout=open("clash.log", "w"),
-        stderr=subprocess.STDOUT,
-    )
-    time.sleep(20)
+    if not os.path.isfile(exe_path):
+        logger.error("Clash 可执行文件不存在: %s，跳过订阅拉取", exe_path)
+        return None
+    try:
+        with open(os.path.join(path, "clash.log"), "w", encoding="utf-8") as log_handle:
+            proc = subprocess.Popen(
+                [exe_path, "-f", os.path.join(path, "proxy.yaml")],
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+    except OSError as e:
+        logger.error("启动 Clash 进程失败: %s", e)
+        return None
+    for _ in range(20):
+        if proc.poll() is not None:
+            logger.error("主 Clash 进程提前退出（exit_code=%s）", proc.returncode)
+            return None
+        time.sleep(1)
     return proc
 
 
 def stop_proxies(proc):
     if proc:
         proc.terminate()
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning("Clash 进程未在 5 秒内退出，强制终止...")
+            proc.kill()
+            proc.wait()
 
 
 def main(env, dirs):
     proc = start_proxies()
     proxies = []
     try:
-        proxies.extend(get_subscribe_proxies())
-    except:
-        pass
-    try:
-        proxies.extend(get_clash_proxies())
-    except:
-        pass
-    stop_proxies(proc)
+        if proc is None:
+            logger.warning("主 Clash 未启动，仍尝试获取可直连订阅源")
+        try:
+            proxies.extend(get_subscribe_proxies(use_local_proxy=proc is not None) or [])
+        except Exception as e:
+            logger.error("获取 RSS 订阅节点时发生未预期异常: %s", e, exc_info=True)
+        try:
+            proxies.extend(get_clash_proxies(use_local_proxy=proc is not None))
+        except Exception as e:
+            logger.error("获取 Clash 订阅节点时发生未预期异常: %s", e, exc_info=True)
+    finally:
+        stop_proxies(proc)
     proxies = filter_proxies(proxies)
+
+    logger.info("去重后共 %d 个节点", len(proxies))
 
     # 异步 TCP 连通性测试（利用 Linux epoll）
     timeout = 5
@@ -197,14 +269,14 @@ def main(env, dirs):
     elif len(proxies) > 500:
         timeout = 4
 
-    print(f"开始异步 TCP 测试，共 {len(proxies)} 个节点...")
+    logger.info("开始异步 TCP 测试，共 %d 个节点...", len(proxies))
     available_proxies = asyncio.run(test_proxies_async(proxies, timeout=timeout))
-    print(f"TCP 测试通过: {len(available_proxies)}/{len(proxies)} 个节点")
+    logger.info("TCP 测试通过: %d/%d 个节点", len(available_proxies), len(proxies))
 
     # 测试 proxies 的可用性
     if available_proxies:
         available_proxies = test_nodes(available_proxies, env, dirs, timeout)
-    print("available proxies length: ", len(available_proxies))
+    logger.info("可用节点总数: %d", len(available_proxies))
 
 
 def parse_command_args():

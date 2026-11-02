@@ -1,3 +1,5 @@
+import logging
+import json
 import os
 import yaml
 import subprocess
@@ -5,13 +7,50 @@ import time
 import requests
 
 BIN_PATH = os.path.join(os.path.dirname(__file__), "../clash")
+logger = logging.getLogger(__name__)
+
+
+def _normalize_proxies(proxies):
+    normalized = []
+    seen_nodes = set()
+    used_names = set()
+    name_counts = {}
+    for proxy in proxies or []:
+        proxy_copy = dict(proxy)
+        identity_data = {
+            key: value for key, value in proxy_copy.items()
+            if key != "name" and not key.startswith("_")
+        }
+        identity = json.dumps(identity_data, sort_keys=True, ensure_ascii=False, default=str)
+        if identity in seen_nodes:
+            continue
+        seen_nodes.add(identity)
+
+        base_name = str(proxy_copy.get("name") or "proxy")
+        name = base_name
+        suffix = name_counts.get(base_name, 1)
+        while name in used_names:
+            name = f"{base_name}-{suffix}"
+            suffix += 1
+        name_counts[base_name] = suffix
+        used_names.add(name)
+        proxy_copy["name"] = name
+        normalized.append(proxy_copy)
+    return normalized
+
 
 class ClashMetaManager:
-    def __init__(self, base, test, controller_port=9090, http_port=7890, socks_port=7891, secret="test-secret", log_file="clash.log"):
+    def __init__(self, base, test, controller_port=9090, http_port=7890, socks_port=7891,
+                 secret="test-secret", log_file="clash.log"):
         self.base = os.path.join(BIN_PATH, base)
         self.test = os.path.join(BIN_PATH, test)
         self.test_template = os.path.join(BIN_PATH, "test_template.yaml")
+        # 模板文件缺失/路径写错时提前抛清晰异常，避免 start() 时才发现
+        for label, path in (("base template", self.base), ("test_template", self.test_template)):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"{label} not found: {path}")
         self.proc = None
+        self._log_handle = None
         self.controller_port = controller_port
         self.http_port = http_port
         self.socks_port = socks_port
@@ -35,23 +74,38 @@ class ClashMetaManager:
         base_config["external-controller"] = f"127.0.0.1:{self.controller_port}"
         base_config["secret"] = self.secret
 
-        if env and file_path and env == "prod" and os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8") as f:
-                test_config = yaml.safe_load(f)
-            proxies = list(proxies)
-            proxies.extend(test_config["proxies"])
+        # prod 环境下，如果提供了历史配置文件，将其中的节点合并进来
+        if env == "prod" and file_path and os.path.exists(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    test_config = yaml.safe_load(f)
+                if test_config and test_config.get("proxies"):
+                    proxies = list(proxies or [])
+                    proxies.extend(test_config["proxies"])
+            except Exception as e:
+                logger.warning("合并历史配置失败（%s）: %s", file_path, e)
 
+        proxies = _normalize_proxies(proxies)
         base_config["proxies"] = proxies
         proxy_names = [p["name"] for p in proxies]
-        base_config["proxy-groups"][0]["proxies"] = proxy_names
+        # 只将节点加入第一个 select 组（"TEST"），其他组保持原样
+        groups = base_config.get("proxy-groups")
+        if groups:
+            groups[0]["proxies"] = proxy_names
 
         target_path = output_path or self.test
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        target_dir = os.path.dirname(target_path)
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
 
         with open(target_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(base_config, f, allow_unicode=True)
 
     def start(self, config_path=None):
+        """
+        启动 Clash 实例，并轮询 API 确认真正就绪（最多等待 30 秒）。
+        比固定 time.sleep(5) 更可靠。
+        """
         exe = "linux-compatible" if os.name != "nt" else "windows-compatible.exe"
         exe_path = os.path.join(BIN_PATH, exe)
         target_path = config_path or self.test
@@ -63,7 +117,22 @@ class ClashMetaManager:
             stdout=self._log_handle,
             stderr=subprocess.STDOUT,
         )
-        time.sleep(5)
+        # 轮询 external-controller API 确认 Clash 已就绪
+        api_url = f"{self.api}/version"
+        for _ in range(30):
+            # 提前终止：若进程已退出（配置错误、端口占用等），无需继续等待
+            if self.proc.poll() is not None:
+                logger.error("Clash 进程提前退出（exit_code=%s），config=%s",
+                             self.proc.returncode, target_path)
+                return
+            try:
+                r = requests.get(api_url, headers=self.headers, timeout=2)
+                if r.status_code == 200:
+                    return
+            except requests.exceptions.ConnectionError:
+                pass
+            time.sleep(1)
+        logger.warning("Clash 实例未在 30 秒内就绪，config=%s，继续执行...", target_path)
 
     def stop(self):
         if self.proc:
@@ -73,22 +142,56 @@ class ClashMetaManager:
             except Exception:
                 self.proc.kill()
             self.proc = None
-        if hasattr(self, "_log_handle") and self._log_handle:
+        if self._log_handle:
             try:
                 self._log_handle.close()
             except Exception:
                 pass
             self._log_handle = None
 
-    def switch_proxy(self, proxy_name=None):
-        r = requests.put(
-            f"{self.api}/proxies/TEST",
-            json={"name": proxy_name},
-            headers=self.headers,
-            timeout=3,
-        )
-        r.raise_for_status()
-        time.sleep(6)
+    def switch_proxy(self, proxy_name=None) -> bool:
+        """
+        通过 Clash REST API 将 TEST 组切换到指定节点。
+        切换后轮询确认节点已生效（最多等待 10 秒）。
+
+        返回 True 表示切换成功；返回 False 表示切换失败或超时，
+        调用方应跳过该节点的测试（避免用错误节点测数据）。
+        """
+        try:
+            r = requests.put(
+                f"{self.api}/proxies/TEST",
+                json={"name": proxy_name},
+                headers=self.headers,
+                timeout=3,
+            )
+            r.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.warning("switch_proxy PUT 失败（%s）: %s", proxy_name, e)
+            return False
+
+        # 轮询确认当前选中节点已切换为 proxy_name
+        last_now = None
+        for _ in range(10):
+            try:
+                status = requests.get(
+                    f"{self.api}/proxies/TEST",
+                    headers=self.headers,
+                    timeout=2,
+                ).json()
+                last_now = status.get("now")
+                if last_now == proxy_name:
+                    return True
+            except requests.exceptions.RequestException:
+                pass
+            except (ValueError, AttributeError) as e:
+                # API 返回非 JSON 或字段缺失
+                logger.debug("switch_proxy GET 解析失败: %s", e)
+                pass
+            time.sleep(0.5)
+
+        # 超时未确认切换成功，记录实际状态便于排查
+        logger.warning("switch_proxy: 等待节点 %s 生效超时（当前 now=%s）", proxy_name, last_now)
+        return False
 
     def list_proxies(self):
         url = f"{self.api}/proxies"
@@ -98,14 +201,32 @@ class ClashMetaManager:
         with open(self.base, "r", encoding="utf-8") as f:
             base_config = yaml.safe_load(f)
 
+        proxies = _normalize_proxies(proxies)
         base_config["proxies"] = proxies
         proxy_names = [p["name"] for p in proxies]
-        groups = base_config["proxy-groups"]
+        groups = base_config.get("proxy-groups")
+        if groups is None:
+            logger.warning("save_config: base 配置中无 proxy-groups，跳过组更新")
+            groups = []
+        # 只将节点名称加入"节点选择"类组（第一个 select 组），
+        # 避免污染"全球直连"、"全球拦截"等不应包含代理节点的组
         for group in groups:
-            group["proxies"].extend(proxy_names)
-        # base_config["proxy-groups"][0]["proxies"] = [p["name"] for p in proxies]
+            group_type = group.get("type", "")
+            group_name = group.get("name", "")
+            # 将节点加入第一个 select 组（通常是"🔰 节点选择"）
+            if group_type == "select" and "节点选择" in group_name:
+                group["proxies"] = proxy_names
+            # url-test 组（如"♻️ 自动选择"）也应包含所有节点，用于自动选优
+            elif group_type == "url-test":
+                group["proxies"] = proxy_names
 
-        with open(os.path.join(BIN_PATH, clash_name), "w", encoding="utf-8") as f:
+        target_path = clash_name
+        if not os.path.isabs(target_path) and not os.path.dirname(target_path):
+            target_path = os.path.join(BIN_PATH, target_path)
+        target_dir = os.path.dirname(target_path)
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(base_config, f, allow_unicode=True)
 
     def clear_test(self):

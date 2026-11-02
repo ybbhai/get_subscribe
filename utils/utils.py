@@ -2,6 +2,7 @@ import asyncio
 import base64
 import concurrent.futures
 import json
+import logging
 import os
 import re
 import socket
@@ -16,6 +17,8 @@ from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
 
 from utils.clash_manager import ClashMetaManager
+
+logger = logging.getLogger(__name__)
 
 
 # 节点分类关键词（用于标记节点特性）
@@ -60,6 +63,10 @@ def decode_vmess(link):
     data = base64.b64decode(raw + "==").decode()
     obj = json.loads(data)
 
+    # 字段缺失保护：add/port/id 为必填字段，缺失时直接跳过该节点
+    if "add" not in obj or "port" not in obj or "id" not in obj:
+        return None
+
     proxy = {
         "name": obj.get("ps", "vmess-node"),
         "type": "vmess",
@@ -84,6 +91,10 @@ def decode_vmess(link):
 def decode_vless(link):
     u = urllib.parse.urlparse(link)
     q = urllib.parse.parse_qs(u.query)
+
+    # 必填字段保护：hostname 或 port 缺失时返回 None
+    if not u.hostname or u.port is None:
+        return None
 
     proxy = {
         "name": urllib.parse.unquote(u.fragment) or "vless-node",
@@ -126,24 +137,41 @@ def decode_ss(link):
     else:
         name = "ss-node"
 
-    decoded = base64.b64decode(raw + "==").decode()
-    method, rest = decoded.split(":")
-    password, server = rest.split("@")
-    host, port = server.split(":")
+    try:
+        decoded = base64.b64decode(raw + "==").decode()
+    except Exception as e:
+        logger.debug("ss 节点 base64 解码失败: %s... %s", link[:40], e)
+        return None
 
-    return {
-        "name": name,
-        "type": "ss",
-        "server": host,
-        "port": int(port),
-        "cipher": method,
-        "password": password
-    }
+    # 标准格式：method:password@host:port；新规范：method~password@host:port（~ 开头是加密口令）
+    try:
+        if "~" in decoded:
+            method, rest = decoded.split("~", 1)
+            password, server = rest.split("@", 1)
+        else:
+            method, rest = decoded.split(":", 1)
+            password, server = rest.split("@", 1)
+        host, port = server.rsplit(":", 1)
+        return {
+            "name": name,
+            "type": "ss",
+            "server": host,
+            "port": int(port),
+            "cipher": method,
+            "password": password
+        }
+    except (ValueError, AttributeError) as e:
+        logger.debug("ss 节点格式解析失败: %s... %s", link[:40], e)
+        return None
 
 
 def decode_hysteria2(link):
     u = urllib.parse.urlparse(link)
     q = urllib.parse.parse_qs(u.query)
+
+    # 必填字段保护：hostname/port/password 缺失时返回 None
+    if not u.hostname or u.port is None or not u.username:
+        return None
 
     return {
         "name": urllib.parse.unquote(u.fragment) or "hysteria2-node",
@@ -163,11 +191,10 @@ def test_link(link, proxies, timeout=10):
             proxies=proxies,
             timeout=timeout,
         )
-        print("test success: ", r)
+        logger.debug("test success: %s -> %s", link, r.status_code)
         return True
     except Exception as e:
-        print(e)
-        # traceback.print_exc()
+        logger.debug("test failed: %s -> %s", link, e)
         return False
 
 
@@ -189,17 +216,22 @@ async def test_link_async(
                 timeout=aiohttp.ClientTimeout(total=timeout),
                 allow_redirects=True
         ) as response:
-            # 读取响应内容以计算下载量
+            # 限制读取量，避免测速下载完整网页或无限流响应。
             async for chunk in response.content.iter_chunked(8192):
                 downloaded_bytes += len(chunk)
+                if downloaded_bytes >= 1024 * 1024:
+                    downloaded_bytes = 1024 * 1024
+                    break
             elapsed = time.time() - start_time
             success = response.status < 400
             return link, success, elapsed, downloaded_bytes
     except asyncio.TimeoutError:
         elapsed = time.time() - start_time
+        logger.debug("link test timeout: %s", link)
         return link, False, elapsed, 0
     except Exception as e:
         elapsed = time.time() - start_time
+        logger.debug("link test error: %s -> %s", link, e)
         return link, False, elapsed, 0
 
 
@@ -214,23 +246,28 @@ async def test_links_concurrent(
     返回: [(链接, 是否成功, 延时秒数, 下载字节数), ...]
     """
     # 创建连接池
-    connector = aiohttp.TCPConnector(limit=max_concurrent, ssl=False)
+    max_concurrent = max(1, min(max_concurrent, 50))
+    semaphore = asyncio.Semaphore(max_concurrent)
+    connector = aiohttp.TCPConnector(limit=max_concurrent)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = []
-        for link in links:
-            task = test_link_async(session, link, proxies, timeout)
-            tasks.append(task)
+        async def limited_test(link):
+            async with semaphore:
+                return await test_link_async(session, link, proxies, timeout)
 
-        # 并发执行所有任务
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+        tasks = [limited_test(link) for link in links]
+
+        # 并发执行所有任务；return_exceptions=True 防止单个 task 异常导致其他 task 被 cancel
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        # 过滤掉异常结果（test_link_async 内部已捕获大部分异常，此处兜底）
+        results = [r for r in raw_results if isinstance(r, tuple)]
         return list(results)
 
 
-def test_proxy_alive(socks_port, timeout=8):
+def test_proxy_alive(http_port, timeout=8):
     proxies = {
-        "http": f"http://127.0.0.1:{socks_port}",
-        "https": f"http://127.0.0.1:{socks_port}",
+        "http": f"http://127.0.0.1:{http_port}",
+        "https": f"http://127.0.0.1:{http_port}",
     }
     links = [
         "https://www.google.com",
@@ -238,7 +275,7 @@ def test_proxy_alive(socks_port, timeout=8):
         "https://github.com"
     ]
 
-    print("开始并发测试链接...")
+    logger.debug("开始并发测试链接（端口 %s）...", http_port)
     start_time = time.time()
     # 多线程并发调用test_link方法，并获取结果
     # 并发测试链接
@@ -250,23 +287,26 @@ def test_proxy_alive(socks_port, timeout=8):
     ))
     # 打印结果
     total_time = time.time() - start_time
-    print(f"\n测试完成，总耗时: {total_time:.2f}秒")
-    print("=" * 50)
-
     success_count = sum(1 for _, success, _, _ in results if success)
-    print(f"成功: {success_count}/{len(results)}")
-    print(f"失败: {len(results) - success_count}/{len(results)}")
-    print("\n详细结果:")
+    logger.debug("连通性测试完成，端口 %s: 成功 %d/%d，总耗时 %.2f 秒", http_port, success_count, len(results), total_time)
     for link, success, elapsed, downloaded_bytes in results:
-        status = "✅ 成功" if success else "❌ 失败"
         speed_kbps = (downloaded_bytes * 8 / elapsed / 1000) if elapsed > 0 and downloaded_bytes > 0 else 0
-        print(f"{status} | {elapsed:.2f}s | {speed_kbps:.0f}KB/s | {link}")
+        logger.debug("  %s | %.2fs | %.0fKB/s | %s", "OK" if success else "FAIL", elapsed, speed_kbps, link)
     return success_count == len(links)
 
 
 def test_node_metrics(node, http_port, timeout=6):
     """
     测试单个节点的延时和网速，返回节点信息和性能指标
+    （同步入口，内部调用 asyncio.run）
+    """
+    return asyncio.run(_test_node_metrics_async(node, http_port, timeout))
+
+
+async def _test_node_metrics_async(node, http_port, timeout=6):
+    """
+    异步版本：测试单个节点的延时和网速。
+    接收已有的 http_port，构建代理后并发请求 4 个测试目标。
     """
     proxies = {
         "http": f"http://127.0.0.1:{http_port}",
@@ -297,14 +337,19 @@ def test_node_metrics(node, http_port, timeout=6):
     }
 
     try:
-        raw_results = asyncio.run(test_links_concurrent(
+        raw_results = await test_links_concurrent(
             [url for _, url in test_links],
             proxies,
             timeout=timeout,
             max_concurrent=5
-        ))
+        )
 
-        for (service, _), (link, success, elapsed, downloaded_bytes) in zip(test_links, raw_results):
+        # 防御：若上游 test_links_concurrent 因内部异常返回不足 4 项，记录并跳过
+        if len(raw_results) != len(test_links):
+            logger.debug("metrics raw_results 长度 %d != test_links %d，仅处理有效项",
+                         len(raw_results), len(test_links))
+        for (service, _), r in zip(test_links, raw_results):
+            link, success, elapsed, downloaded_bytes = r
             if success:
                 speed_kbps = (downloaded_bytes * 8 / elapsed / 1000) if elapsed > 0 else 0
                 results[f"{service}_latency"] = round(elapsed * 1000, 1)  # 转为毫秒
@@ -322,9 +367,21 @@ def test_node_metrics(node, http_port, timeout=6):
         results["is_available"] = any(results.get(f"{s}_latency") is not None for s in ["google", "youtube", "chatgpt"])
 
     except Exception as e:
-        print(f"Metrics test error for {node.get('name', 'unknown')}: {e}")
+        logger.warning("Metrics test error for %s: %s", node.get('name', 'unknown'), e)
 
     return results
+
+
+async def test_nodes_batch_metrics(nodes, http_port, timeout=6):
+    """
+    在一个 event loop 中批量测试多个节点的性能指标（避免重复创建/销毁 event loop）。
+    注意：由于 switch_proxy 是串行状态操作，此函数仅适用于
+    "同一节点并发测多个目标"的场景，不适用于"切换节点后测每个节点"。
+    """
+    tasks = [_test_node_metrics_async(node, http_port, timeout) for node in nodes]
+    # return_exceptions=True 防止单个 task 异常导致整个 gather 失败
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    return [r for r in raw_results if isinstance(r, dict)]
 
 
 def test_proxy_telnet(proxy, timeout=8):
@@ -333,30 +390,47 @@ def test_proxy_telnet(proxy, timeout=8):
         s.settimeout(timeout)
         s.connect((proxy["server"], proxy["port"]))
         s.close()
-        print("proxy ip test success: ", proxy["server"], proxy["port"])
         return proxy
     except Exception as e:
-        print("proxy ip test failed: ", e)
+        logger.debug("proxy ip test failed: %s:%s - %s", proxy.get("server"), proxy.get("port"), e)
         return None
 
 
 async def test_proxy_telnet_async(proxy, timeout=5):
     """异步 TCP 连接测试，利用 Linux epoll 提高并发效率"""
+    server = proxy.get("server", "")
+    port = proxy.get("port")
+    if not server or port is None:
+        return None
+    # IPv6 裸字面量需加方括号，否则 asyncio.open_connection 解析失败
+    if ':' in server and not server.startswith('['):
+        host = f"[{server}]"
+    else:
+        host = server
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(proxy["server"], proxy["port"]),
+            asyncio.open_connection(host, port),
             timeout=timeout
         )
         writer.close()
         await writer.wait_closed()
         return proxy
     except Exception as e:
+        logger.debug("TCP test failed: %s:%s - %s", server, port, e)
         return None
 
 
-async def test_proxies_async(proxies, timeout=5):
-    """批量异步 TCP 测试"""
-    tasks = [test_proxy_telnet_async(p, timeout=timeout) for p in proxies]
+async def test_proxies_async(proxies, timeout=5, max_concurrent=200):
+    """
+    批量异步 TCP 测试，使用信号量限制并发数，避免大量节点时端口耗尽。
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def limited_test(proxy):
+        async with semaphore:
+            return await test_proxy_telnet_async(proxy, timeout=timeout)
+
+    tasks = [limited_test(p) for p in proxies]
     results = await asyncio.gather(*tasks)
     return [r for r in results if r is not None]
 
@@ -385,7 +459,7 @@ def _test_single_node(node, env, dirs, timeout, worker_id):
         alive = test_proxy_alive(http_port, timeout=timeout)
         return node if alive else None
     except Exception as e:
-        print(f"Batch test failed for {node.get('name', 'unknown')}: {e}")
+        logger.error("Single node test failed for %s: %s", node.get('name', 'unknown'), e)
         return None
     finally:
         manager.stop()
@@ -422,31 +496,34 @@ def _test_batch_nodes(batch_proxies, env, dirs, timeout, worker_id):
         manager.write_config(batch_proxies, env=env, output_path=config_path)
         manager.start(config_path=config_path)
 
-        # 先测试整体连通性
-        overall_alive = test_proxy_alive(http_port, timeout=timeout)
-
-        if not overall_alive:
-            return []
-
-        # 对每个节点进行详细的性能测试
+        # 对每个节点：先通过 Clash API 切换到该节点，再测性能
         for node in batch_proxies:
+            node_name = node.get("name", "unknown")
+            # 切换到当前测试的节点（必须，否则测的是默认选中节点）
+            if not manager.switch_proxy(node_name):
+                logger.warning("切换代理 %s 失败，跳过", node_name)
+                continue
+
             node_metrics = test_node_metrics(node, http_port, timeout)
             if node_metrics["is_available"]:
+                # 复制节点，避免修改调用方传入的原始字典
+                proxy_copy = dict(node)
                 # 清理节点名称中的 Unicode 编码
-                original_name = node.get("name", "")
-                node["name"] = decode_unicode_name(original_name)
-                # 添加性能指标到节点
-                node["_latency"] = node_metrics["avg_latency"]
-                node["_speed_kbps"] = node_metrics["avg_speed_kbps"]
-                node["_categories"] = classify_proxy(node)
-                metrics_results.append(node)
-                print(f"  → {node['name']}: OK (延迟: {node_metrics['avg_latency']}ms, 速度: {node_metrics['avg_speed_kbps']:.0f}KB/s)")
+                proxy_copy["name"] = decode_unicode_name(proxy_copy.get("name", ""))
+                # 附加性能指标（仅在有有效数据时写入，避免 None 导致排序崩溃）
+                if node_metrics["avg_latency"] is not None:
+                    proxy_copy["_latency"] = node_metrics["avg_latency"]
+                proxy_copy["_speed_kbps"] = node_metrics["avg_speed_kbps"]
+                proxy_copy["_categories"] = classify_proxy(proxy_copy)
+                metrics_results.append(proxy_copy)
+                logger.debug("  -> %s: OK (延迟: %sms, 速度: %.0fKB/s)",
+                             proxy_copy["name"], node_metrics["avg_latency"], node_metrics["avg_speed_kbps"])
             else:
-                print(f"  → {node.get('name', 'unknown')}: FAIL")
+                logger.debug("  -> %s: FAIL", node.get("name", "unknown"))
 
         return metrics_results
     except Exception as e:
-        print(f"Batch test failed: {e}")
+        logger.error("Batch test failed (worker_id=%d): %s", worker_id, e)
         return []
     finally:
         manager.stop()
@@ -468,27 +545,31 @@ def sort_proxies_by_performance(proxies):
         return []
 
     def proxy_sort_key(proxy):
-        # 获取性能指标，默认为最大值（排在最后）
-        latency = proxy.get("_latency", 999999)
-        speed = proxy.get("_speed_kbps", 0)
+        # 获取性能指标，默认值表示无数据
+        latency = proxy.get("_latency")
+        speed = proxy.get("_speed_kbps", 0) or 0
         categories = proxy.get("_categories", set())
 
-        # 如果没有性能数据，使用默认值
-        if latency == 999999:
-            return (1, 0, 0)  # 排在最后
+        # 没有有效延迟数据，排在最后
+        if latency is None:
+            return (1, 0, 0)
 
         # 评分：低延迟和高速度都有益
         # 延迟权重更高（0.7），速度权重较低（0.3）
         latency_score = 1000 / (latency + 1)  # 防止除零
         speed_score = min(speed / 100, 100)  # 归一化到 0-100
 
-        # 综合评分
+        # 综合评分（越大越好：低延迟 + 高速度）
         total_score = latency_score * 0.7 + speed_score * 0.3
 
-        # 特殊服务加分（如果有类别标记）
+        # 特殊服务加分（类别越多越优先）
         category_bonus = len(categories) * 5
 
-        return (-total_score, -category_bonus, latency)  # 负号表示降序
+        # 排序键（升序，键越小越靠前）：
+        # -total_score   → 总评分越高越靠前
+        # -category_bonus→ 匹配类别越多越靠前
+        # latency        → 延迟越低越靠前（最终 tie-breaker）
+        return (-total_score, -category_bonus, latency)
 
     # 按评分排序
     sorted_proxies = sorted(proxies, key=proxy_sort_key)
@@ -503,44 +584,75 @@ def sort_proxies_by_performance(proxies):
 
 
 def test_nodes(proxies, env, dirs, timeout=6):
+    """
+    批量测试节点，并发启动多个 Clash 实例。
+
+    多 Worker 设计说明：
+    - 将节点按 batch_size 分批，每批内的所有节点由 1 个 Clash 实例（1 个 worker）处理
+    - 不同批次之间并行执行（最多 worker_count 个 Clash 实例同时运行）
+    - 每个 worker 使用独立端口（http_port = 7890 + worker_id * 10），互不干扰
+    - 同一批内所有节点共享同一个 Clash 实例，通过 proxy-groups 切换测试
+    """
     if not proxies:
         return []
 
-    print("开始批量测试节点（并发启动多个 Clash 实例）...")
+    # Clash 要求代理名称唯一；解码后再分配名称，避免转义名称产生碰撞。
+    used_names = set()
+    name_counts = {}
+    normalized_proxies = []
+    for proxy in proxies:
+        proxy_copy = dict(proxy)
+        base_name = decode_unicode_name(proxy_copy.get("name", "")) or "proxy"
+        name = base_name
+        suffix = name_counts.get(base_name, 1)
+        while name in used_names:
+            name = f"{base_name}-{suffix}"
+            suffix += 1
+        name_counts[base_name] = suffix
+        used_names.add(name)
+        proxy_copy["name"] = name
+        normalized_proxies.append(proxy_copy)
+    proxies = normalized_proxies
+
+    logger.info("开始批量测试节点（并发启动多个 Clash 实例）...")
     start_time = time.time()
 
-    # 每批测试数量（一个 Clash 实例可管理多个节点）
+    # 每批测试数量（一个 Clash 实例可同时处理多个节点）
     batch_size = 20
-    worker_count = min(8, len(proxies))
+
+    # 将节点均分为多个 batch
+    batches = [proxies[i:i + batch_size] for i in range(0, len(proxies), batch_size)]
+    # 最大并发 worker 数 = 实际 batch 数（不超过 8）
+    worker_count = min(8, len(batches))
     results = []
 
-    count = 0
-    for batch_start in range(0, len(proxies), batch_size):
-        batch = proxies[batch_start:batch_start + batch_size]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(worker_count, len(batch))) as executor:
-            future_map = {
-                executor.submit(_test_batch_nodes, batch, env, dirs, timeout, slot): (slot, batch)
-                for slot in range(len(batch))
-            }
+    # 使用线程池并发处理各 batch，每个 batch 对应 1 个 worker（1 个 Clash 实例）
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(_test_batch_nodes, batch, env, dirs, timeout, worker_id): (worker_id, batch)
+            for worker_id, batch in enumerate(batches)
+        }
 
-            for future in concurrent.futures.as_completed(future_map):
-                slot, batch = future_map[future]
-                try:
-                    alive_nodes = future.result()
-                    results.extend(alive_nodes)
-                    count += len(batch)
-                    print(f"已测试 {count}/{len(proxies)} 个节点，可用节点: {len(results)}")
-                except Exception as e:
-                    print(f"Batch test error: {e}")
+        completed = 0
+        for future in concurrent.futures.as_completed(future_map):
+            worker_id, batch = future_map[future]
+            completed += len(batch)
+            try:
+                alive_nodes = future.result()
+                results.extend(alive_nodes)
+            except Exception as e:
+                logger.error("Batch test error (worker_id=%d): %s", worker_id, e)
+            logger.info("已测试 %d/%d 个节点，可用节点: %d（worker_id=%d）",
+                        completed, len(proxies), len(results), worker_id)
 
     total_time = time.time() - start_time
-    print(f"批量测试完成，总耗时: {total_time:.2f}秒")
-    print(f"成功节点: {len(results)}/{len(proxies)}")
+    logger.info("批量测试完成，总耗时: %.2f 秒", total_time)
+    logger.info("成功节点: %d/%d", len(results), len(proxies))
 
     # 按性能排序
     if results:
         results = sort_proxies_by_performance(results)
-        print("节点已按性能排序（延迟低、速度快的在前）")
+        logger.info("节点已按性能排序（延迟低、速度快的在前）")
 
     if env != "dev" and results:
         manager = ClashMetaManager('base_template.yaml', 'test_config.yaml')
@@ -552,23 +664,26 @@ def test_nodes(proxies, env, dirs, timeout=6):
 def v2ray_2_clash(file_path=None, content=None):
     nodes = None
     if file_path and os.path.exists(file_path):
+        # 每行是一个 base64 编码的订阅内容，需全部解码后拼接
+        decoded_lines = []
         with open(file_path, encoding="utf-8") as f:
             for line in f:
                 if not line:
                     continue
                 try:
                     data = line.strip()
-                    decoded = base64.b64decode(data).decode("utf-8")
-                    nodes = decoded
+                    decoded_lines.append(base64.b64decode(data).decode("utf-8"))
                 except Exception as e:
-                    print(e)
+                    logger.debug("base64 解码失败（%s）: %s", data[:40], e)
+        if decoded_lines:
+            nodes = "\n".join(decoded_lines)
     elif content:
         try:
             nodes = base64.b64decode(content).decode("utf-8")
         except Exception as e:
-            print(e)
+            logger.debug("base64 解码失败: %s", e)
     proxies = []
-    name_list = {}
+    name_list = {}  # name -> 出现次数（从1开始）
     if nodes:
         for node in nodes.splitlines():
             try:
@@ -582,14 +697,16 @@ def v2ray_2_clash(file_path=None, content=None):
                 elif node.startswith("hysteria2://"):
                     proxy = decode_hysteria2(node)
                 if proxy:
-                    if proxy["name"] not in name_list:
-                        name_list[proxy["name"]] = 1
-                    elif proxy["name"] in name_list:
-                        proxy["name"] = proxy["name"] + str(name_list[proxy["name"]])
-                        name_list[proxy["name"]] = name_list[proxy["name"]] + 1
+                    original_name = proxy["name"]
+                    if original_name not in name_list:
+                        name_list[original_name] = 1
+                    else:
+                        # 追加后缀使名字唯一，计数基于原始名字
+                        name_list[original_name] += 1
+                        proxy["name"] = f"{original_name}-{name_list[original_name]}"
                     proxies.append(proxy)
             except Exception as e:
-                print("解析失败:", node[:40], e)
+                logger.debug("解析失败: %s... %s", node[:40], e)
     # if proxies:
     #     proxies = test_nodes(proxies)
     # print(proxies)
@@ -603,24 +720,31 @@ def filter_proxies(proxies):
     filtered_proxies = []
     proxy_name_map = {}
     for proxy in proxies:
-        # 获取proxy节点信息
-        server = proxy["server"]
-        port = proxy["port"]
-        type = proxy["type"]
+        # 获取proxy节点信息（避免用 type 作变量名遮蔽内置函数）
+        server = proxy.get("server")
+        port = proxy.get("port")
+        proxy_type = proxy.get("type")
+        # 必填字段缺失的节点直接丢弃
+        if server is None or port is None or proxy_type is None:
+            logger.debug("节点缺少必填字段（server/port/type），丢弃: %s", proxy.get("name", "?"))
+            continue
         cipher = proxy.get("cipher", "")
         uuid = proxy.get("uuid", "")
         # 检查是否已经存在相同的proxy节点
-        if (server, port, type, cipher, uuid) not in proxies_set:
-            proxies_set.append((server, port, type, cipher, uuid))
-            name = proxy["name"]
+        if (server, port, proxy_type, cipher, uuid) not in proxies_set:
+            proxies_set.append((server, port, proxy_type, cipher, uuid))
+            # 用浅拷贝避免修改调用方的原始 dict
+            proxy_copy = dict(proxy)
+            name = proxy_copy.get("name", "")
             # 清理名称中的 Unicode 编码
             name = decode_unicode_name(name)
             if name not in proxy_name_map:
                 proxy_name_map[name] = 1
+                proxy_copy["name"] = name
             else:
-                proxy["name"] = name + "-" + str(proxy_name_map[name])
+                proxy_copy["name"] = f"{name}-{proxy_name_map[name]}"
                 proxy_name_map[name] += 1
-            filtered_proxies.append(proxy)
+            filtered_proxies.append(proxy_copy)
     return filtered_proxies
 
 
@@ -750,24 +874,26 @@ def parse_special_clash(content):
         if proxy:
             proxies.append(proxy)
         else:
-            print(f"⚠️  第{idx + 1}行解析失败（内容为空）：{line}...")
+            logger.debug("第%d行解析失败（内容为空）：%s...", idx + 1, line[:80])
 
     return proxies
 
 
 # 解决SSL协议兼容问题的适配器
 class SSLAdapter(HTTPAdapter):
-    def init_poolmanager(self, connections, maxsize, block=False):
-        # 创建SSL上下文，兼容TLSv1.2，关闭所有验证
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        """创建启用证书验证的 TLSv1.2+ SSL 上下文。"""
         context = ssl.create_default_context()
-        context.check_hostname = False  # 关闭主机名检查
-        context.verify_mode = ssl.CERT_NONE  # 关闭证书验证
-        context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1  # 仅启用TLSv1.2+
+        context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1  # 仅启用 TLSv1.2+
 
-        # 初始化PoolManager，只传必要参数，避免重复
+        # 保存池参数（用于序列化/反序列化，与父类行为一致）
+        self._pool_connections = connections
+        self._pool_maxsize = maxsize
+        self._pool_block = block
+
         self.poolmanager = PoolManager(
             num_pools=connections,
             maxsize=maxsize,
             block=block,
-            ssl_context=context
+            ssl_context=context,
         )
