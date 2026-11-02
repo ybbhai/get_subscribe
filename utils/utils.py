@@ -207,7 +207,7 @@ async def test_link_async(
     """
     异步测试链接，返回 (链接, 是否成功, 延时秒数, 下载字节数)
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     downloaded_bytes = 0
     try:
         async with session.get(
@@ -222,15 +222,19 @@ async def test_link_async(
                 if downloaded_bytes >= 1024 * 1024:
                     downloaded_bytes = 1024 * 1024
                     break
-            elapsed = time.time() - start_time
-            success = response.status < 400
+            elapsed = time.perf_counter() - start_time
+            target_host = urllib.parse.urlparse(link).hostname
+            final_host = response.url.host
+            success = 200 <= response.status < 300 and (
+                final_host == target_host or final_host.endswith("." + target_host)
+            )
             return link, success, elapsed, downloaded_bytes
     except asyncio.TimeoutError:
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         logger.debug("link test timeout: %s", link)
         return link, False, elapsed, 0
     except Exception as e:
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         logger.debug("link test error: %s -> %s", link, e)
         return link, False, elapsed, 0
 
@@ -317,7 +321,7 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
     test_links = [
         ("google", "https://www.google.com"),
         ("youtube", "https://www.youtube.com"),
-        ("chatgpt", "https://api.openai.com"),
+        ("chatgpt", "https://chatgpt.com"),
         ("github", "https://github.com"),
     ]
 
@@ -348,8 +352,10 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
         if len(raw_results) != len(test_links):
             logger.debug("metrics raw_results 长度 %d != test_links %d，仅处理有效项",
                          len(raw_results), len(test_links))
-        for (service, _), r in zip(test_links, raw_results):
+        services_by_url = {url: service for service, url in test_links}
+        for r in raw_results:
             link, success, elapsed, downloaded_bytes = r
+            service = services_by_url[link]
             if success:
                 speed_kbps = (downloaded_bytes * 8 / elapsed / 1000) if elapsed > 0 else 0
                 results[f"{service}_latency"] = round(elapsed * 1000, 1)  # 转为毫秒
@@ -357,14 +363,17 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
 
         # 计算平均延时和速度
         latencies = [results[f"{s}_latency"] for s in ["google", "youtube", "chatgpt", "github"] if results.get(f"{s}_latency")]
-        speeds = [results[f"{s}_speed_kbps"] for s in ["google", "youtube", "chatgpt", "github"] if results.get(f"{s}_speed_kbps")]
-
         if latencies:
             results["avg_latency"] = round(sum(latencies) / len(latencies), 1)
-        if speeds:
-            results["avg_speed_kbps"] = round(sum(speeds) / len(speeds), 1)
-
         results["is_available"] = any(results.get(f"{s}_latency") is not None for s in ["google", "youtube", "chatgpt"])
+        if results["is_available"]:
+            speed_results = await test_links_concurrent(
+                ["https://speed.cloudflare.com/__down?bytes=1048576"],
+                proxies, timeout=timeout, max_concurrent=1
+            )
+            for _, success, elapsed, downloaded_bytes in speed_results:
+                if success and elapsed > 0:
+                    results["avg_speed_kbps"] = round(downloaded_bytes * 8 / elapsed / 1000, 1)
 
     except Exception as e:
         logger.warning("Metrics test error for %s: %s", node.get('name', 'unknown'), e)
@@ -514,9 +523,12 @@ def _test_batch_nodes(batch_proxies, env, dirs, timeout, worker_id):
                 if node_metrics["avg_latency"] is not None:
                     proxy_copy["_latency"] = node_metrics["avg_latency"]
                 proxy_copy["_speed_kbps"] = node_metrics["avg_speed_kbps"]
-                proxy_copy["_categories"] = classify_proxy(proxy_copy)
+                proxy_copy["_categories"] = {
+                    service for service in ("google", "youtube", "chatgpt")
+                    if node_metrics[f"{service}_latency"] is not None
+                }
                 metrics_results.append(proxy_copy)
-                logger.debug("  -> %s: OK (延迟: %sms, 速度: %.0fKB/s)",
+                logger.debug("  -> %s: OK (延迟: %sms, 速度: %.0fkbit/s)",
                              proxy_copy["name"], node_metrics["avg_latency"], node_metrics["avg_speed_kbps"])
             else:
                 logger.debug("  -> %s: FAIL", node.get("name", "unknown"))
@@ -552,7 +564,7 @@ def sort_proxies_by_performance(proxies):
 
         # 没有有效延迟数据，排在最后
         if latency is None:
-            return (1, 0, 0)
+            return (float("inf"), 0, 0)
 
         # 评分：低延迟和高速度都有益
         # 延迟权重更高（0.7），速度权重较低（0.3）
@@ -573,12 +585,6 @@ def sort_proxies_by_performance(proxies):
 
     # 按评分排序
     sorted_proxies = sorted(proxies, key=proxy_sort_key)
-
-    # 清理内部性能指标字段
-    for proxy in sorted_proxies:
-        proxy.pop("_latency", None)
-        proxy.pop("_speed_kbps", None)
-        proxy.pop("_categories", None)
 
     return sorted_proxies
 
@@ -651,7 +657,7 @@ def test_nodes(proxies, env, dirs, timeout=6):
 
     # 按性能排序
     if results:
-        results = sort_proxies_by_performance(results)
+        results = sort_proxies_by_performance(results)[:50]
         logger.info("节点已按性能排序（延迟低、速度快的在前）")
 
     if env != "dev" and results:

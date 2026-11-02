@@ -86,7 +86,10 @@ class ClashMetaManager:
                 logger.warning("合并历史配置失败（%s）: %s", file_path, e)
 
         proxies = _normalize_proxies(proxies)
-        base_config["proxies"] = proxies
+        base_config["proxies"] = [
+            {key: value for key, value in proxy.items() if not key.startswith("_")}
+            for proxy in proxies
+        ]
         proxy_names = [p["name"] for p in proxies]
         # 只将节点加入第一个 select 组（"TEST"），其他组保持原样
         groups = base_config.get("proxy-groups")
@@ -124,7 +127,7 @@ class ClashMetaManager:
             if self.proc.poll() is not None:
                 logger.error("Clash 进程提前退出（exit_code=%s），config=%s",
                              self.proc.returncode, target_path)
-                return
+                raise RuntimeError(f"Clash exited before readiness: {target_path}")
             try:
                 r = requests.get(api_url, headers=self.headers, timeout=2)
                 if r.status_code == 200:
@@ -132,7 +135,7 @@ class ClashMetaManager:
             except requests.exceptions.ConnectionError:
                 pass
             time.sleep(1)
-        logger.warning("Clash 实例未在 30 秒内就绪，config=%s，继续执行...", target_path)
+        raise TimeoutError(f"Clash API not ready within 30 seconds: {target_path}")
 
     def stop(self):
         if self.proc:
@@ -201,8 +204,11 @@ class ClashMetaManager:
         with open(self.base, "r", encoding="utf-8") as f:
             base_config = yaml.safe_load(f)
 
-        proxies = _normalize_proxies(proxies)
-        base_config["proxies"] = proxies
+        proxies = _normalize_proxies(proxies)[:50]
+        base_config["proxies"] = [
+            {key: value for key, value in proxy.items() if not key.startswith("_")}
+            for proxy in proxies
+        ]
         proxy_names = [p["name"] for p in proxies]
         groups = base_config.get("proxy-groups")
         if groups is None:
@@ -213,12 +219,31 @@ class ClashMetaManager:
         for group in groups:
             group_type = group.get("type", "")
             group_name = group.get("name", "")
+            service = next((service for service in ("google", "youtube", "chatgpt")
+                            if service in group_name.lower()), None)
+            if service:
+                members = [proxy["name"] for proxy in proxies
+                           if service in proxy.get("_categories", set())]
+                group["proxies"] = members or ["REJECT"]
+                if not members:
+                    group["type"] = "select"
+                    group.pop("url", None)
+                    group.pop("interval", None)
+                continue
             # 将节点加入第一个 select 组（通常是"🔰 节点选择"）
             if group_type == "select" and "节点选择" in group_name:
                 group["proxies"] = proxy_names
             # url-test 组（如"♻️ 自动选择"）也应包含所有节点，用于自动选优
             elif group_type == "url-test":
                 group["proxies"] = proxy_names
+
+        global_group = next((group for group in groups if group.get("name") == "GLOBAL"), None)
+        if global_group is None:
+            global_group = {"name": "GLOBAL", "type": "select"}
+            groups.append(global_group)
+        global_group["include-all"] = False
+        global_group["proxies"] = proxy_names[:10] or ["REJECT"]
+        base_config["proxy-groups"] = groups
 
         target_path = clash_name
         if not os.path.isabs(target_path) and not os.path.dirname(target_path):
