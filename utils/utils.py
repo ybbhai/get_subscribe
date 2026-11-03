@@ -209,6 +209,7 @@ async def test_link_async(
     """
     start_time = time.perf_counter()
     downloaded_bytes = 0
+    response_body = bytearray()
     try:
         async with session.get(
                 link,
@@ -219,6 +220,8 @@ async def test_link_async(
             # 限制读取量，避免测速下载完整网页或无限流响应。
             async for chunk in response.content.iter_chunked(8192):
                 downloaded_bytes += len(chunk)
+                if link == "https://chatgpt.com/api/auth/providers":
+                    response_body.extend(chunk)
                 if downloaded_bytes >= 1024 * 1024:
                     downloaded_bytes = 1024 * 1024
                     break
@@ -228,6 +231,15 @@ async def test_link_async(
             success = 200 <= response.status < 300 and (
                 final_host == target_host or final_host.endswith("." + target_host)
             )
+            if success and link == "https://chatgpt.com/api/auth/providers":
+                try:
+                    providers = json.loads(response_body)
+                    success = isinstance(providers, dict) and any(
+                        isinstance(provider, dict) and provider.get("id") == "openai"
+                        for provider in providers.values()
+                    )
+                except (ValueError, UnicodeDecodeError):
+                    success = False
             return link, success, elapsed, downloaded_bytes
     except asyncio.TimeoutError:
         elapsed = time.perf_counter() - start_time
@@ -312,6 +324,7 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
     异步版本：测试单个节点的延时和网速。
     接收已有的 http_port，构建代理后并发请求 4 个测试目标。
     """
+    timeout = max(timeout, 6)
     proxies = {
         "http": f"http://127.0.0.1:{http_port}",
         "https": f"http://127.0.0.1:{http_port}",
@@ -360,6 +373,17 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
                 speed_kbps = (downloaded_bytes * 8 / elapsed / 1000) if elapsed > 0 else 0
                 results[f"{service}_latency"] = round(elapsed * 1000, 1)  # 转为毫秒
                 results[f"{service}_speed_kbps"] = round(speed_kbps, 1)
+
+        if results["chatgpt_latency"] is None:
+            auth_results = await test_links_concurrent(
+                ["https://chatgpt.com/api/auth/providers"],
+                proxies, timeout=timeout, max_concurrent=1
+            )
+            for _, success, elapsed, downloaded_bytes in auth_results:
+                if success:
+                    results["chatgpt_latency"] = round(elapsed * 1000, 1)
+                    results["chatgpt_speed_kbps"] = round(
+                        downloaded_bytes * 8 / elapsed / 1000, 1) if elapsed > 0 else 0
 
         # 计算平均延时和速度
         latencies = [results[f"{s}_latency"] for s in ["google", "youtube", "chatgpt", "github"] if results.get(f"{s}_latency")]

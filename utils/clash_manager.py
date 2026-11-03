@@ -214,8 +214,8 @@ class ClashMetaManager:
         if groups is None:
             logger.warning("save_config: base 配置中无 proxy-groups，跳过组更新")
             groups = []
-        # 只将节点名称加入"节点选择"类组（第一个 select 组），
-        # 避免污染"全球直连"、"全球拦截"等不应包含代理节点的组
+        selection = next((group["name"] for group in groups if "节点选择" in group["name"]), None)
+        automatic = next((group["name"] for group in groups if "自动选择" in group["name"]), None)
         for group in groups:
             group_type = group.get("type", "")
             group_name = group.get("name", "")
@@ -224,26 +224,30 @@ class ClashMetaManager:
             if service:
                 members = [proxy["name"] for proxy in proxies
                            if service in proxy.get("_categories", set())]
-                group["proxies"] = members or ["REJECT"]
-                if not members:
-                    group["type"] = "select"
-                    group.pop("url", None)
-                    group.pop("interval", None)
+                group["proxies"] = list(dict.fromkeys(members + [name for name in
+                    (selection, automatic) if name])) or ["DIRECT"]
+                group["type"] = "select"
+                group.pop("url", None)
+                group.pop("interval", None)
                 continue
-            # 将节点加入第一个 select 组（通常是"🔰 节点选择"）
             if group_type == "select" and "节点选择" in group_name:
-                group["proxies"] = proxy_names
-            # url-test 组（如"♻️ 自动选择"）也应包含所有节点，用于自动选优
+                group["proxies"] = list(dict.fromkeys(
+                    ([automatic] if automatic else []) + group.get("proxies", []) + proxy_names))
             elif group_type == "url-test":
-                group["proxies"] = proxy_names
+                group["proxies"] = proxy_names or ["DIRECT"]
+            elif group_type == "select" and selection in group.get("proxies", []):
+                group["proxies"] = list(dict.fromkeys(group["proxies"] +
+                    ([automatic] if automatic else []) + proxy_names))
 
         global_group = next((group for group in groups if group.get("name") == "GLOBAL"), None)
         if global_group is None:
             global_group = {"name": "GLOBAL", "type": "select"}
             groups.append(global_group)
+        global_group["type"] = "select"
         global_group["include-all"] = False
-        global_group["proxies"] = proxy_names[:10] or ["REJECT"]
+        global_group["proxies"] = [name for name in (selection, automatic) if name] + proxy_names or ["DIRECT"]
         base_config["proxy-groups"] = groups
+        base_config.setdefault("profile", {})["store-selected"] = True
 
         target_path = clash_name
         if not os.path.isabs(target_path) and not os.path.dirname(target_path):
