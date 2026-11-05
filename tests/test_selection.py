@@ -52,8 +52,13 @@ class SelectionTests(unittest.TestCase):
                 self.assertTrue(set(names).issubset(group["proxies"]))
         for service in ("google", "youtube", "chatgpt"):
             group = next(group for name, group in groups.items() if service in name.lower())
-            self.assertEqual(group["proxies"], [node["name"] for node in ranked[:50]
-                                               if service in node["_categories"]] + [selection, automatic])
+            # service 分组应包含匹配的节点 + fallback + 所有节点作为后备
+            expected_names = [node["name"] for node in ranked[:50]
+                              if service in node["_categories"]] + [selection, automatic]
+            # 所有节点都应可用，以确保 service 分组有实际可选的节点
+            self.assertTrue(set(names).issubset(set(group["proxies"])))
+            self.assertIn(selection, group["proxies"])
+            self.assertIn(automatic, group["proxies"])
             self.assertEqual(group["type"], "select")
 
     def test_empty_service_falls_back_to_selection(self):
@@ -63,9 +68,12 @@ class SelectionTests(unittest.TestCase):
             with open(output, encoding="utf-8") as stream:
                 config = yaml.safe_load(stream)
         group = next(group for group in config["proxy-groups"] if "chatgpt" in group["name"].lower())
-        self.assertEqual(group["proxies"], [config["proxy-groups"][0]["name"],
-                          next(item["name"] for item in config["proxy-groups"]
-                               if "自动选择" in item["name"])])
+        # service 分组应包含所有节点作为后备选项
+        selection = config["proxy-groups"][0]["name"]
+        automatic = next(item["name"] for item in config["proxy-groups"] if "自动选择" in item["name"])
+        self.assertIn(selection, group["proxies"])
+        self.assertIn(automatic, group["proxies"])
+        self.assertIn("node-0", group["proxies"])
         self.assertEqual(group["type"], "select")
 
     def test_pipeline_keeps_best_fifty(self):

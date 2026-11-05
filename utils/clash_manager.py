@@ -19,8 +19,11 @@ def _normalize_proxies(proxies):
         proxy_copy = dict(proxy)
         identity_data = {
             key: value for key, value in proxy_copy.items()
-            if key != "name" and not key.startswith("_")
+            if key != "name"
         }
+        # 对 _categories 等集合类型进行排序，确保序列化结果一致
+        if isinstance(identity_data.get('_categories'), set):
+            identity_data['_categories'] = sorted(identity_data['_categories'])
         identity = json.dumps(identity_data, sort_keys=True, ensure_ascii=False, default=str)
         if identity in seen_nodes:
             continue
@@ -224,8 +227,10 @@ class ClashMetaManager:
             if service:
                 members = [proxy["name"] for proxy in proxies
                            if service in proxy.get("_categories", set())]
-                group["proxies"] = list(dict.fromkeys(members + [name for name in
-                    (selection, automatic) if name])) or ["DIRECT"]
+                # 添加所有节点作为后备选项，避免 service 分组只有"节点选择"和"自动选择"而无实际节点
+                all_names = list(dict.fromkeys(members + [name for name in
+                    (selection, automatic) if name] + proxy_names))
+                group["proxies"] = all_names or ["DIRECT"]
                 group["type"] = "select"
                 group.pop("url", None)
                 group.pop("interval", None)

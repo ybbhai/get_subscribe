@@ -21,12 +21,6 @@ from utils.clash_manager import ClashMetaManager
 logger = logging.getLogger(__name__)
 
 
-# 节点分类关键词（用于标记节点特性）
-NODE_CATEGORY_KEYWORDS = {
-    "google": ["google", "ggl", "谷歌", "美国", "日本", "新加坡", "hk", "tw", "jp", "sg", "us"],
-    "youtube": ["youtube", "yt", "谷歌", "美国", "日本", "新加坡", "hk", "tw", "jp", "sg", "us"],
-    "chatgpt": ["chatgpt", "openai", "anthropic", "美国", "日本", "新加坡", "hk", "tw", "jp", "sg", "us"],
-}
 
 
 def decode_unicode_name(name: str) -> str:
@@ -48,14 +42,6 @@ def decode_unicode_name(name: str) -> str:
     return result
 
 
-def classify_proxy(proxy: dict) -> set:
-    """根据节点名称关键词分类节点"""
-    name = proxy.get("name", "").lower()
-    categories = set()
-    for category, keywords in NODE_CATEGORY_KEYWORDS.items():
-        if any(kw in name for kw in keywords):
-            categories.add(category)
-    return categories
 
 
 def decode_vmess(link):
@@ -405,30 +391,6 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
     return results
 
 
-async def test_nodes_batch_metrics(nodes, http_port, timeout=6):
-    """
-    在一个 event loop 中批量测试多个节点的性能指标（避免重复创建/销毁 event loop）。
-    注意：由于 switch_proxy 是串行状态操作，此函数仅适用于
-    "同一节点并发测多个目标"的场景，不适用于"切换节点后测每个节点"。
-    """
-    tasks = [_test_node_metrics_async(node, http_port, timeout) for node in nodes]
-    # return_exceptions=True 防止单个 task 异常导致整个 gather 失败
-    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-    return [r for r in raw_results if isinstance(r, dict)]
-
-
-def test_proxy_telnet(proxy, timeout=8):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((proxy["server"], proxy["port"]))
-        s.close()
-        return proxy
-    except Exception as e:
-        logger.debug("proxy ip test failed: %s:%s - %s", proxy.get("server"), proxy.get("port"), e)
-        return None
-
-
 async def test_proxy_telnet_async(proxy, timeout=5):
     """异步 TCP 连接测试，利用 Linux epoll 提高并发效率"""
     server = proxy.get("server", "")
@@ -468,8 +430,8 @@ async def test_proxies_async(proxies, timeout=5, max_concurrent=200):
     return [r for r in results if r is not None]
 
 
-def _test_single_node(node, env, dirs, timeout, worker_id):
-    http_port = 7890 + worker_id * 10
+async def _test_single_node(node, env, dirs, timeout, worker_id):
+    http_port = 7900 + worker_id * 10
     socks_port = http_port + 1
     controller_port = 9090 + worker_id
     config_name = f"clash_test_{worker_id}.yaml"
@@ -506,7 +468,7 @@ def _test_single_node(node, env, dirs, timeout, worker_id):
 
 def _test_batch_nodes(batch_proxies, env, dirs, timeout, worker_id):
     """批量测试：一个 Clash 实例同时测试多个节点，并记录性能指标"""
-    http_port = 7890 + worker_id * 10
+    http_port = 7900 + worker_id * 10
     socks_port = http_port + 1
     controller_port = 9090 + worker_id
     config_name = f"clash_test_{worker_id}.yaml"
@@ -620,7 +582,7 @@ def test_nodes(proxies, env, dirs, timeout=6):
     多 Worker 设计说明：
     - 将节点按 batch_size 分批，每批内的所有节点由 1 个 Clash 实例（1 个 worker）处理
     - 不同批次之间并行执行（最多 worker_count 个 Clash 实例同时运行）
-    - 每个 worker 使用独立端口（http_port = 7890 + worker_id * 10），互不干扰
+    - 每个 worker 使用独立端口（http_port = 7900 + worker_id * 10），互不干扰
     - 同一批内所有节点共享同一个 Clash 实例，通过 proxy-groups 切换测试
     """
     if not proxies:
