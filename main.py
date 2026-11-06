@@ -12,7 +12,7 @@ import schedule
 import yaml
 
 from utils.utils import test_nodes, v2ray_2_clash, SSLAdapter, clean_yaml_content, parse_special_clash, filter_proxies, \
-    test_proxy_telnet, test_proxies_async
+    test_proxy_telnet_async, test_proxies_async
 
 requests.packages.urllib3.disable_warnings()
 
