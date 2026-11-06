@@ -76,6 +76,21 @@ class SelectionTests(unittest.TestCase):
         self.assertIn("node-0", group["proxies"])
         self.assertEqual(group["type"], "select")
 
+    def test_hbo_max_rule_covers_max_domain_before_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "clash.yaml")
+            ClashMetaManager("base_template.yaml", "test_config.yaml").save_config(
+                self.make_nodes(1), output
+            )
+            with open(output, encoding="utf-8") as stream:
+                config = yaml.safe_load(stream)
+
+        rules = config["rules"]
+        max_rule = next(rule for rule in rules if rule.startswith("DOMAIN-SUFFIX,max.com,"))
+        match_index = next(index for index, rule in enumerate(rules) if rule.startswith("MATCH,"))
+        self.assertEqual(max_rule, "DOMAIN-SUFFIX,max.com,🌍 国外媒体")
+        self.assertLess(rules.index(max_rule), match_index)
+
     def test_pipeline_keeps_best_fifty(self):
         with patch("utils.utils._test_batch_nodes", side_effect=lambda batch, *args: batch):
             result = test_nodes(list(reversed(self.make_nodes(60))), "dev", "/unused")
