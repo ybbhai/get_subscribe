@@ -5,40 +5,51 @@ on:
   workflow_dispatch:
   # 定时触发
   schedule:
-    # 每6小时获取一次
+    # 每12小时获取一次
     - cron: '0 */12 * * *'
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # 兜底超时：主流程单次执行应在数分钟内完成，避免异常时占满默认 6 小时配额
+    timeout-minutes: 40
     steps:
     - name: 迁出代码
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
     - name: 安装Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
     - name: 加载缓存
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/run_in_Actions/requirements.txt') }}
+        # 原 key 指向不存在的 **/run_in_Actions/requirements.txt，缓存永远不会命中
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
     - name: 设置时区
       run: sudo timedatectl set-timezone 'Asia/Shanghai'
     - name: 安装依赖
       run: |
+        python -m pip install --upgrade pip
         pip install -r requirements.txt
-    - name: 执行任务
+    - name: 离线回归测试
       run: |
-        python main.py
+        python -m unittest discover -s tests -v
+    - name: 执行任务
+      env:
+        # 裸跑 python main.py 会落到 dev 环境而不导出配置，必须显式指定 prod 与输出目录
+        PYTHONUNBUFFERED: '1'
+      run: |
+        python main.py -p prod -d ./subscribe
 
     - name: 提交更改
       run: |
          git config core.ignorecase false
          git config --local user.email "admin@ermao.net"
          git config --local user.name "ermaozi"
-         git add .
-         git commit -m "$(date '+%Y-%m-%d %H:%M:%S')更新订阅链接"
+         git add -A
+         # 内容无变化时 git commit 会以非零码退出，导致后续 push 被跳过
+         git diff --staged --quiet || git commit -m "$(date '+%Y-%m-%d %H:%M:%S')更新订阅链接"
          git push

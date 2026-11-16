@@ -1,1 +1,25 @@
 venv/
+.venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 运行时临时产物（不要提交）
+log/
+clash/clash.log
+clash/test_config.yaml
+clash/clash_test_*.yaml
+clash/clash_test_*.log
+# 生成的配置镜像，内含真实节点凭据，禁止提交
+clash/proxy_generated.yaml
+clash/geoip.metadb
+clash/geosite.dat
+clash/geoip.dat
+clash/country.mmdb
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

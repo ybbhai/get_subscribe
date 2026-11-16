@@ -1,0 +1,16 @@
+# 主 Clash 实例配置：仅在拉取订阅源时使用，本身不承担分流职责。
+# 该文件为空时内核会直接报 "configuration file ... is empty" 并退出，
+# 导致订阅拉取退化为直连（且 start_proxies() 会浪费等待时间），因此这里给出最小可用配置。
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+mode: global
+log-level: info
+external-controller: 127.0.0.1:9099
+ipv6: false
+
+proxies: []
+proxy-groups: []
+
+rules:
+  - MATCH,DIRECT

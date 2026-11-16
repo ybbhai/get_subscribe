@@ -1,26 +1,48 @@
 import asyncio
 import base64
+import binascii
 import concurrent.futures
 import json
 import logging
 import os
 import re
-import socket
 import ssl
 import time
 import urllib.parse
-from typing import Optional, Tuple, List, Any
+from typing import Optional, Tuple, List
 
 import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3 import PoolManager
 
-from utils.clash_manager import ClashMetaManager
+from utils.clash_manager import ClashMetaManager, _normalize_proxies
 
 logger = logging.getLogger(__name__)
 
 
+def b64_decode_text(raw: str) -> Optional[str]:
+    """
+    宽松解码订阅里出现的 base64 文本。
+
+    订阅源常见三种写法，原先的 ``base64.b64decode(raw + "==")`` 只兼容第一种：
+      1. 标准 base64，带/不带 ``=`` 填充
+      2. URL-safe base64（``-``/``_`` 代替 ``+``/``/``），常见于 SIP002 的 ss 链接
+      3. 换行/空格包裹的多行内容
+
+    解码失败返回 None，由调用方决定跳过该节点。
+    """
+    if not raw:
+        return None
+    cleaned = re.sub(r"\s+", "", raw)
+    cleaned = cleaned.replace("-", "+").replace("_", "/")
+    # 去掉已有的填充后重新补齐，避免出现 "===="
+    cleaned = cleaned.rstrip("=")
+    cleaned += "=" * (-len(cleaned) % 4)
+    try:
+        return base64.b64decode(cleaned, validate=False).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError) as e:
+        logger.debug("base64 解码失败（%s...）: %s", raw[:40], e)
+        return None
 
 
 def decode_unicode_name(name: str) -> str:
@@ -46,13 +68,22 @@ def decode_unicode_name(name: str) -> str:
 
 def decode_vmess(link):
     raw = link.replace("vmess://", "")
-    data = base64.b64decode(raw + "==").decode()
-    obj = json.loads(data)
+    data = b64_decode_text(raw)
+    if data is None:
+        return None
+    try:
+        obj = json.loads(data)
+    except ValueError as e:
+        logger.debug("vmess 节点 JSON 解析失败: %s... %s", link[:40], e)
+        return None
+    if not isinstance(obj, dict):
+        return None
 
     # 字段缺失保护：add/port/id 为必填字段，缺失时直接跳过该节点
     if "add" not in obj or "port" not in obj or "id" not in obj:
         return None
 
+    network = obj.get("net") or "tcp"
     proxy = {
         "name": obj.get("ps", "vmess-node"),
         "type": "vmess",
@@ -61,15 +92,26 @@ def decode_vmess(link):
         "uuid": obj["id"],
         "alterId": int(obj.get("aid", 0)),
         "cipher": obj.get("scy", "auto"),
-        "network": obj.get("net", "tcp"),
+        "network": network,
         "tls": obj.get("tls") == "tls",
     }
 
-    if obj.get("net") == "ws":
+    # sni 缺失时内核会退回 server 作为 SNI，导致 CDN 落地证书校验失败，需显式透传
+    sni = obj.get("sni") or obj.get("host") or ""
+    if sni:
+        proxy["servername"] = sni
+
+    alpn = obj.get("alpn")
+    if alpn:
+        proxy["alpn"] = [item for item in str(alpn).split(",") if item]
+
+    if network == "ws":
         proxy["ws-opts"] = {
             "path": obj.get("path", "/"),
             "headers": {"Host": obj.get("host", "")}
         }
+    elif network == "grpc":
+        proxy["grpc-opts"] = {"grpc-service-name": obj.get("path", "")}
 
     return proxy
 
@@ -82,31 +124,52 @@ def decode_vless(link):
     if not u.hostname or u.port is None:
         return None
 
+    # security=reality 同样需要开启 TLS，否则内核在拨号期直接报
+    # "failed to use vision, maybe tls is not enable"
+    security = (q.get("security", ["none"])[0] or "none").lower()
+    network = q.get("type", ["tcp"])[0] or "tcp"
+    tls_enabled = security in ("tls", "reality", "xtls")
+
     proxy = {
         "name": urllib.parse.unquote(u.fragment) or "vless-node",
         "type": "vless",
         "server": u.hostname,
         "port": u.port,
         "uuid": u.username,
-        "network": q.get("type", ["tcp"])[0],
-        "tls": q.get("security", ["none"])[0] == "tls",
+        "network": network,
+        "tls": tls_enabled,
     }
 
-    if "flow" in q:
+    sni = q.get("sni", [""])[0] or q.get("host", [""])[0]
+    if sni:
+        proxy["servername"] = sni
+
+    if tls_enabled:
+        # REALITY 基于 uTLS，缺少 client-fingerprint 时内核校验能过但拨号必失败：
+        # "REALITY is based on uTLS, please set a client-fingerprint"
+        proxy["client-fingerprint"] = q.get("fp", ["chrome"])[0] or "chrome"
+        alpn = q.get("alpn", [""])[0]
+        if alpn:
+            proxy["alpn"] = [item for item in alpn.split(",") if item]
+        if q.get("allowInsecure", ["0"])[0] == "1" or q.get("insecure", ["0"])[0] == "1":
+            proxy["skip-cert-verify"] = True
+
+    if "flow" in q and tls_enabled:
         proxy["flow"] = q["flow"][0]
 
-    if proxy["network"] == "ws":
+    if network == "ws":
         proxy["ws-opts"] = {
             "path": q.get("path", ["/"])[0],
             "headers": {
                 "Host": q.get("host", [""])[0]
             }
         }
+    elif network == "grpc":
+        proxy["grpc-opts"] = {
+            "grpc-service-name": q.get("serviceName", [""])[0] or q.get("path", [""])[0]
+        }
 
-    if "sni" in q:
-        proxy["servername"] = q["sni"][0]
-
-    if q.get("security", [""])[0] == "reality":
+    if security == "reality":
         proxy["reality-opts"] = {
             "public-key": q.get("pbk", [""])[0],
             "short-id": q.get("sid", [""])[0]
@@ -115,40 +178,127 @@ def decode_vless(link):
     return proxy
 
 
-def decode_ss(link):
-    raw = link.replace("ss://", "")
-    if "#" in raw:
-        raw, name = raw.split("#", 1)
-        name = urllib.parse.unquote(name)
-    else:
-        name = "ss-node"
+def _ss_plugin_opts(plugin_spec):
+    """把 SIP002 的 plugin 串转换为 Mihomo 的 plugin / plugin-opts。
 
-    try:
-        decoded = base64.b64decode(raw + "==").decode()
-    except Exception as e:
-        logger.debug("ss 节点 base64 解码失败: %s... %s", link[:40], e)
-        return None
+    SIP002 写法：``plugin=obfs-local;obfs=http;obfs-host=example.com``
+    形如 ``name;key=value;flag``，flag 为空值的键视为布尔开关。
+    """
+    if not plugin_spec:
+        return None, None
+    parts = [part for part in plugin_spec.split(";") if part]
+    plugin_name = parts[0]
+    raw_opts = {}
+    for part in parts[1:]:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            raw_opts[key.strip()] = value.strip()
+        else:
+            raw_opts[part.strip()] = True
+
+    if plugin_name in ("obfs-local", "simple-obfs", "obfs"):
+        opts = {}
+        mode = raw_opts.get("obfs") or raw_opts.get("mode")
+        if mode:
+            opts["mode"] = mode
+        host = raw_opts.get("obfs-host") or raw_opts.get("host")
+        if host:
+            opts["host"] = host
+        return "obfs", opts or None
+
+    if plugin_name == "v2ray-plugin":
+        opts = {}
+        mode = raw_opts.get("mode")
+        if isinstance(mode, str) and mode:
+            opts["mode"] = mode
+        host = raw_opts.get("host")
+        if isinstance(host, str) and host:
+            opts["host"] = host
+        path = raw_opts.get("path")
+        if isinstance(path, str) and path:
+            opts["path"] = path
+        if raw_opts.get("tls") is True:
+            opts["tls"] = True
+        return "v2ray-plugin", opts or None
+
+    logger.debug("不支持的 ss plugin: %s，忽略插件参数", plugin_name)
+    return None, None
+
+
+def decode_ss(link):
+    """解析 ss 链接，同时兼容旧式整体 base64 与 SIP002 两种写法。
+
+    旧式：``ss://base64(method:password@host:port)#name``
+    SIP002：``ss://base64url(method:password)@host:port?plugin=...#name``
+
+    原实现只支持旧式，遇到 SIP002 会直接返回 None，导致大量 ss 节点被丢弃。
+    """
+    raw = link[len("ss://"):] if link.startswith("ss://") else link
+
+    name = "ss-node"
+    if "#" in raw:
+        raw, fragment = raw.split("#", 1)
+        name = urllib.parse.unquote(fragment) or name
+
+    query = ""
+    if "?" in raw:
+        raw, query = raw.split("?", 1)
+    raw = raw.rstrip("/")
+    q = urllib.parse.parse_qs(query)
+
+    hostport = None
+    if "@" in raw:
+        # SIP002：userinfo 既可以是 base64url(method:password)，也允许直接写
+        # 百分号编码的明文 method:password。base64 字母表不含 ":"，
+        # 因此用是否含 ":" 即可无歧义地区分两种写法。
+        userinfo, hostport = raw.rsplit("@", 1)
+        if ":" in userinfo:
+            credentials = urllib.parse.unquote(userinfo)
+        else:
+            credentials = b64_decode_text(userinfo)
+            if not credentials:
+                logger.debug("ss 节点 userinfo 解码失败: %s...", link[:40])
+                return None
+        decoded = credentials
+    else:
+        decoded = b64_decode_text(raw)
+        if not decoded:
+            logger.debug("ss 节点 base64 解码失败: %s...", link[:40])
+            return None
 
     # 标准格式：method:password@host:port；新规范：method~password@host:port（~ 开头是加密口令）
     try:
         if "~" in decoded:
             method, rest = decoded.split("~", 1)
-            password, server = rest.split("@", 1)
         else:
             method, rest = decoded.split(":", 1)
-            password, server = rest.split("@", 1)
+        if hostport is not None:
+            # SIP002 已经把 host:port 拆出来了，口令里再出现 "@" 也不会污染地址
+            password, server = rest, hostport
+        else:
+            # 旧式整串 base64 时口令本身可能含 "@"（如 qwerREWQ@@），
+            # 必须从右侧 rsplit，否则 server 会变成 "@@1.2.3.4"
+            password, server = rest.rsplit("@", 1)
         host, port = server.rsplit(":", 1)
-        return {
+        proxy = {
             "name": name,
             "type": "ss",
-            "server": host,
+            "server": host.strip("[]"),
             "port": int(port),
-            "cipher": method,
-            "password": password
+            "cipher": method.strip(),
+            "password": password,
         }
     except (ValueError, AttributeError) as e:
         logger.debug("ss 节点格式解析失败: %s... %s", link[:40], e)
         return None
+
+    plugin, plugin_opts = _ss_plugin_opts(q.get("plugin", [""])[0])
+    if plugin:
+        proxy["plugin"] = plugin
+        if plugin_opts:
+            proxy["plugin-opts"] = plugin_opts
+
+    return proxy
 
 
 def decode_hysteria2(link):
@@ -168,20 +318,6 @@ def decode_hysteria2(link):
         "sni": q.get("sni", [""])[0],
         "skip-cert-verify": q.get("insecure", ["0"])[0] == "1"
     }
-
-
-def test_link(link, proxies, timeout=10):
-    try:
-        r = requests.get(
-            link,
-            proxies=proxies,
-            timeout=timeout,
-        )
-        logger.debug("test success: %s -> %s", link, r.status_code)
-        return True
-    except Exception as e:
-        logger.debug("test failed: %s -> %s", link, e)
-        return False
 
 
 async def test_link_async(
@@ -426,47 +562,20 @@ async def test_proxies_async(proxies, timeout=5, max_concurrent=200):
             return await test_proxy_telnet_async(proxy, timeout=timeout)
 
     tasks = [limited_test(p) for p in proxies]
-    results = await asyncio.gather(*tasks)
-    return [r for r in results if r is not None]
+    # return_exceptions=True：单个节点抛出非 Exception 异常（如 CancelledError）时
+    # 不会连带取消其余全部探测任务
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = []
+    for proxy, result in zip(proxies, raw_results):
+        if isinstance(result, BaseException):
+            logger.debug("TCP 测试异常（%s）: %s", proxy.get("name", "?"), result)
+            continue
+        if result is not None:
+            results.append(result)
+    return results
 
 
-async def _test_single_node(node, env, dirs, timeout, worker_id):
-    http_port = 7900 + worker_id * 10
-    socks_port = http_port + 1
-    controller_port = 9090 + worker_id
-    config_name = f"clash_test_{worker_id}.yaml"
-    log_name = f"clash_test_{worker_id}.log"
-    config_path = os.path.join(dirs, config_name)
-    log_path = os.path.join(dirs, log_name)
-
-    manager = ClashMetaManager(
-        'base_template.yaml',
-        config_name,
-        controller_port=controller_port,
-        http_port=http_port,
-        socks_port=socks_port,
-        log_file=log_path,
-    )
-
-    try:
-        manager.write_config([node], env=env, output_path=config_path)
-        manager.start(config_path=config_path)
-        alive = test_proxy_alive(http_port, timeout=timeout)
-        return node if alive else None
-    except Exception as e:
-        logger.error("Single node test failed for %s: %s", node.get('name', 'unknown'), e)
-        return None
-    finally:
-        manager.stop()
-        for path in (config_path, log_path):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-
-
-def _test_batch_nodes(batch_proxies, env, dirs, timeout, worker_id):
+def _test_batch_nodes(batch_proxies, dirs, timeout, worker_id):
     """批量测试：一个 Clash 实例同时测试多个节点，并记录性能指标"""
     http_port = 7900 + worker_id * 10
     socks_port = http_port + 1
@@ -488,7 +597,7 @@ def _test_batch_nodes(batch_proxies, env, dirs, timeout, worker_id):
     metrics_results = []
 
     try:
-        manager.write_config(batch_proxies, env=env, output_path=config_path)
+        manager.write_config(batch_proxies, output_path=config_path)
         manager.start(config_path=config_path)
 
         # 对每个节点：先通过 Clash API 切换到该节点，再测性能
@@ -533,11 +642,19 @@ def _test_batch_nodes(batch_proxies, env, dirs, timeout, worker_id):
                     pass
 
 
+# 归一化基准：延迟 0ms 得满分，达到或超过 1000ms 记 0 分；速度 10Mbps 记满分
+_LATENCY_REFERENCE_MS = 1000.0
+_SPEED_REFERENCE_KBPS = 10000.0
+
+
 def sort_proxies_by_performance(proxies):
     """
     根据性能指标对节点进行排序
     优先选择延迟低、速度快的节点
     同时考虑节点的服务类别匹配
+
+    评分公式：latency_score * 0.7 + speed_score * 0.3 + 类别加分，
+    其中两项分数均已归一化到 0-100。
     """
     if not proxies:
         return []
@@ -553,9 +670,11 @@ def sort_proxies_by_performance(proxies):
             return (float("inf"), 0, 0)
 
         # 评分：低延迟和高速度都有益
-        # 延迟权重更高（0.7），速度权重较低（0.3）
-        latency_score = 1000 / (latency + 1)  # 防止除零
-        speed_score = min(speed / 100, 100)  # 归一化到 0-100
+        # 两项都必须先归一化到同一量纲（0-100），否则权重没有实际意义。
+        # 原实现 latency_score = 1000/(latency+1) 在真实 100~600ms 区间只有 1.6~10，
+        # 而 speed_score 很容易顶到上限 100，结果速度完全主导排序，与注释声明的 0.7 相反。
+        latency_score = max(0.0, 100.0 * (1 - latency / _LATENCY_REFERENCE_MS))
+        speed_score = min(100.0 * speed / _SPEED_REFERENCE_KBPS, 100.0)
 
         # 综合评分（越大越好：低延迟 + 高速度）
         total_score = latency_score * 0.7 + speed_score * 0.3
@@ -621,7 +740,7 @@ def test_nodes(proxies, env, dirs, timeout=6):
     # 使用线程池并发处理各 batch，每个 batch 对应 1 个 worker（1 个 Clash 实例）
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
         future_map = {
-            executor.submit(_test_batch_nodes, batch, env, dirs, timeout, worker_id): (worker_id, batch)
+            executor.submit(_test_batch_nodes, batch, dirs, timeout, worker_id): (worker_id, batch)
             for worker_id, batch in enumerate(batches)
         }
 
@@ -649,6 +768,12 @@ def test_nodes(proxies, env, dirs, timeout=6):
     if env != "dev" and results:
         manager = ClashMetaManager('base_template.yaml', 'test_config.yaml')
         manager.save_config(results, os.path.join(dirs, "clash.yaml"))
+    elif results:
+        # dev 模式刻意不覆盖投放文件，但必须显式提示，否则表现为"跑成功却没产物"
+        logger.warning(
+            "当前为 dev 环境，未写入 %s；如需导出请使用 -p prod",
+            os.path.join(dirs, "clash.yaml"),
+        )
 
     return results
 
@@ -662,18 +787,13 @@ def v2ray_2_clash(file_path=None, content=None):
             for line in f:
                 if not line:
                     continue
-                try:
-                    data = line.strip()
-                    decoded_lines.append(base64.b64decode(data).decode("utf-8"))
-                except Exception as e:
-                    logger.debug("base64 解码失败（%s）: %s", data[:40], e)
+                txt = b64_decode_text(line.strip())
+                if txt:
+                    decoded_lines.append(txt)
         if decoded_lines:
             nodes = "\n".join(decoded_lines)
     elif content:
-        try:
-            nodes = base64.b64decode(content).decode("utf-8")
-        except Exception as e:
-            logger.debug("base64 解码失败: %s", e)
+        nodes = b64_decode_text(content)
     proxies = []
     name_list = {}  # name -> 出现次数（从1开始）
     if nodes:
@@ -705,39 +825,55 @@ def v2ray_2_clash(file_path=None, content=None):
     return proxies
 
 
+def _is_dialable_host(server):
+    """判断 server 是否是内核能够拨号的合法主机名或 IP。
+
+    真实订阅里出现过 ``server: "@@168.126.234.247"`` 这类脏数据（ss 口令里带
+    "@"，被错误切分后残留到地址段）。这种节点能通过 YAML 校验，但内核在
+    拨号期只会报 DNS 解析失败，用户看到的现象就是"分组里的节点无法使用"。
+    """
+    host = str(server or "").strip()
+    if not host:
+        return False
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    # 主机名只允许字母、数字、连字符、点和下划线；IPv6 额外允许冒号。
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._:")
+    if any(char not in allowed for char in host):
+        return False
+    # 不允许以连字符/点开头结尾，也不允许出现连续的点
+    if host[0] in "-." or host[-1] in "-." or ".." in host:
+        return False
+    return True
+
+
 def filter_proxies(proxies):
     if not proxies:
         return []
-    proxies_set = []
-    filtered_proxies = []
-    proxy_name_map = {}
+    candidates = []
     for proxy in proxies:
-        # 获取proxy节点信息（避免用 type 作变量名遮蔽内置函数）
-        server = proxy.get("server")
-        port = proxy.get("port")
-        proxy_type = proxy.get("type")
         # 必填字段缺失的节点直接丢弃
-        if server is None or port is None or proxy_type is None:
+        if proxy.get("server") is None or proxy.get("port") is None or proxy.get("type") is None:
             logger.debug("节点缺少必填字段（server/port/type），丢弃: %s", proxy.get("name", "?"))
             continue
-        cipher = proxy.get("cipher", "")
-        uuid = proxy.get("uuid", "")
-        # 检查是否已经存在相同的proxy节点
-        if (server, port, proxy_type, cipher, uuid) not in proxies_set:
-            proxies_set.append((server, port, proxy_type, cipher, uuid))
-            # 用浅拷贝避免修改调用方的原始 dict
-            proxy_copy = dict(proxy)
-            name = proxy_copy.get("name", "")
-            # 清理名称中的 Unicode 编码
-            name = decode_unicode_name(name)
-            if name not in proxy_name_map:
-                proxy_name_map[name] = 1
-                proxy_copy["name"] = name
-            else:
-                proxy_copy["name"] = f"{name}-{proxy_name_map[name]}"
-                proxy_name_map[name] += 1
-            filtered_proxies.append(proxy_copy)
-    return filtered_proxies
+        # 地址段含非法字符（如 "@@1.2.3.4"）时内核无法解析，直接丢弃
+        if not _is_dialable_host(proxy.get("server")):
+            logger.warning("节点 server 不是合法主机名，丢弃: %s (%r)",
+                           proxy.get("name", "?"), proxy.get("server"))
+            continue
+        # 用浅拷贝避免修改调用方的原始 dict，同时清理名称中的 Unicode 编码
+        proxy_copy = dict(proxy)
+        proxy_copy["name"] = decode_unicode_name(proxy_copy.get("name", ""))
+        candidates.append(proxy_copy)
+
+    # 去重键必须覆盖节点全部有效字段。
+    # 原实现用 (server, port, type, cipher, uuid) 作为键，会把下列互不相同的节点误判为重复：
+    #   - ss 同 host:port:cipher 但 password 不同
+    #   - trojan / hysteria2 同 host:port 但 password 不同
+    #   - vless 同 host:port:uuid 但 ws-opts 路径、network(tcp/grpc)、sni、alpn 不同
+    # 这类节点在本函数中被丢弃后就再也无法进入后续测速环节，属于静默丢节点。
+    # _normalize_proxies 用「除 name 外全部字段的 JSON」作为身份，并负责名称去重。
+    return _normalize_proxies(candidates)
 
 
 def clean_yaml_content(content):
@@ -873,19 +1009,21 @@ def parse_special_clash(content):
 
 # 解决SSL协议兼容问题的适配器
 class SSLAdapter(HTTPAdapter):
+    """强制 TLSv1.2+ 的 requests HTTPAdapter。
+
+    原实现自己 new 了 PoolManager 且没有把 **pool_kwargs 传下去，也绕过了父类
+    初始化，requests 在新版本里传入的 pool 参数会被静默忽略；另外
+    ``ssl.OP_NO_TLSv1`` 系列在 Python 3.10+ 已废弃，改用 minimum_version 更稳妥。
+    """
+
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        """创建启用证书验证的 TLSv1.2+ SSL 上下文。"""
         context = ssl.create_default_context()
-        context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1  # 仅启用 TLSv1.2+
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        pool_kwargs["ssl_context"] = context
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
 
-        # 保存池参数（用于序列化/反序列化，与父类行为一致）
-        self._pool_connections = connections
-        self._pool_maxsize = maxsize
-        self._pool_block = block
-
-        self.poolmanager = PoolManager(
-            num_pools=connections,
-            maxsize=maxsize,
-            block=block,
-            ssl_context=context,
-        )
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        context = ssl.create_default_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        proxy_kwargs["ssl_context"] = context
+        return super().proxy_manager_for(proxy, **proxy_kwargs)

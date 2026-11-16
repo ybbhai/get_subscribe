@@ -9,6 +9,39 @@ import requests
 BIN_PATH = os.path.join(os.path.dirname(__file__), "../clash")
 logger = logging.getLogger(__name__)
 
+# 上次生成的完整配置副本，落在 clash/ 下供下一次采集时启动本地代理使用
+GENERATED_PROXY_CONFIG = "proxy_generated.yaml"
+
+
+def read_listen_ports(config_path, default_controller=9090, default_mixed=7890):
+    """读取配置文件里实际生效的 controller 与 http 端口。
+
+    生成的配置来自 base_template.yaml（controller 9090 / port 7890），
+    而 proxy.yaml 用的是 9099，两者不一致；健康检查必须按文件里的真实值来，
+    否则会出现“进程已就绪但轮询不到”的假失败。
+    """
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        logger.warning("读取 %s 端口配置失败: %s", config_path, e)
+        return default_controller, default_mixed
+
+    controller_port = default_controller
+    controller = config.get("external-controller")
+    if isinstance(controller, str) and ":" in controller:
+        _, _, port_text = controller.rpartition(":")
+        if port_text.isdigit():
+            controller_port = int(port_text)
+
+    mixed_port = default_mixed
+    for key in ("mixed-port", "port"):
+        value = config.get(key)
+        if isinstance(value, int) and value > 0:
+            mixed_port = value
+            break
+    return controller_port, mixed_port
+
 
 def _normalize_proxies(proxies):
     normalized = []
@@ -68,7 +101,7 @@ class ClashMetaManager:
     def headers(self):
         return {"Authorization": f"Bearer {self.secret}"}
 
-    def write_config(self, proxies, env=None, file_path=None, output_path=None):
+    def write_config(self, proxies, output_path=None):
         with open(self.test_template, "r", encoding="utf-8") as f:
             base_config = yaml.safe_load(f)
 
@@ -76,17 +109,6 @@ class ClashMetaManager:
         base_config["socks-port"] = self.socks_port
         base_config["external-controller"] = f"127.0.0.1:{self.controller_port}"
         base_config["secret"] = self.secret
-
-        # prod 环境下，如果提供了历史配置文件，将其中的节点合并进来
-        if env == "prod" and file_path and os.path.exists(file_path):
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    test_config = yaml.safe_load(f)
-                if test_config and test_config.get("proxies"):
-                    proxies = list(proxies or [])
-                    proxies.extend(test_config["proxies"])
-            except Exception as e:
-                logger.warning("合并历史配置失败（%s）: %s", file_path, e)
 
         proxies = _normalize_proxies(proxies)
         base_config["proxies"] = [
@@ -199,10 +221,6 @@ class ClashMetaManager:
         logger.warning("switch_proxy: 等待节点 %s 生效超时（当前 now=%s）", proxy_name, last_now)
         return False
 
-    def list_proxies(self):
-        url = f"{self.api}/proxies"
-        return requests.get(url, headers=self.headers).json()
-
     def save_config(self, proxies, clash_name):
         with open(self.base, "r", encoding="utf-8") as f:
             base_config = yaml.safe_load(f)
@@ -227,9 +245,11 @@ class ClashMetaManager:
             if service:
                 members = [proxy["name"] for proxy in proxies
                            if service in proxy.get("_categories", set())]
-                # 添加所有节点作为后备选项，避免 service 分组只有"节点选择"和"自动选择"而无实际节点
-                all_names = list(dict.fromkeys(members + [name for name in
-                    (selection, automatic) if name] + proxy_names))
+                # 实测通过的节点优先，其后才是"节点选择"、"自动选择"兜底。
+                # 顺序很关键：Mihomo 默认选中第一个成员，若把兜底组放前面，
+                # 该分组会默认指向自动选择而不是实测可用的节点。
+                all_names = list(dict.fromkeys(members + proxy_names +
+                    [name for name in (selection, automatic) if name]))
                 group["proxies"] = all_names or ["DIRECT"]
                 group["type"] = "select"
                 group.pop("url", None)
@@ -250,7 +270,11 @@ class ClashMetaManager:
             groups.append(global_group)
         global_group["type"] = "select"
         global_group["include-all"] = False
-        global_group["proxies"] = [name for name in (selection, automatic) if name] + proxy_names or ["DIRECT"]
+        # GLOBAL 必须按模板顺序列出全部代理组，再追加具体节点。
+        # OpenClash 内置面板（metacubexd）用 GLOBAL.all 的下标给代理组排序，
+        # 不在 GLOBAL.all 中的组会被排到最前面，导致"节点选择/自动选择"被挤到末尾。
+        group_names = [group["name"] for group in groups if group.get("name") != "GLOBAL"]
+        global_group["proxies"] = list(dict.fromkeys(group_names + proxy_names)) or ["DIRECT"]
         base_config["proxy-groups"] = groups
         base_config.setdefault("profile", {})["store-selected"] = True
 
@@ -263,6 +287,14 @@ class ClashMetaManager:
         with open(target_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(base_config, f, allow_unicode=True)
 
-    def clear_test(self):
-        if os.path.exists(self.test):
-            os.remove(self.test)
+        # 在 clash/ 下留一份副本，供下一次采集时用真实节点启动本地代理
+        # （main.start_proxies 会优先读取它，见 GENERATED_PROXY_CONFIG）。
+        mirror_path = os.path.join(BIN_PATH, GENERATED_PROXY_CONFIG)
+        if os.path.abspath(mirror_path) != os.path.abspath(target_path):
+            try:
+                with open(mirror_path, "w", encoding="utf-8") as f:
+                    yaml.safe_dump(base_config, f, allow_unicode=True)
+                logger.info("已写入代理配置副本: %s", mirror_path)
+            except OSError as e:
+                # 副本只是优化项，写失败不应影响主配置产出
+                logger.warning("写入代理配置副本失败（%s）: %s", mirror_path, e)

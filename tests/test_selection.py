@@ -42,7 +42,10 @@ class SelectionTests(unittest.TestCase):
             expected_order.append("GLOBAL")
         self.assertEqual([group["name"] for group in config["proxy-groups"]], expected_order)
         self.assertEqual(groups[selection]["proxies"][0], automatic)
-        self.assertEqual(groups["GLOBAL"]["proxies"], [selection, automatic] + names)
+        # GLOBAL 需要按模板顺序列出全部代理组，再追加节点：OpenClash 内置面板
+        # 按 GLOBAL.all 的下标给代理组排序，缺少组名会让这些组被挤到列表最前面。
+        expected_global = [name for name in expected_order if name != "GLOBAL"] + names
+        self.assertEqual(groups["GLOBAL"]["proxies"], expected_global)
         self.assertEqual(groups["GLOBAL"]["type"], "select")
         self.assertFalse(groups["GLOBAL"]["include-all"])
         self.assertTrue(config["profile"]["store-selected"])
@@ -53,9 +56,11 @@ class SelectionTests(unittest.TestCase):
         for service in ("google", "youtube", "chatgpt"):
             group = next(group for name, group in groups.items() if service in name.lower())
             # service 分组应包含匹配的节点 + fallback + 所有节点作为后备
-            expected_names = [node["name"] for node in ranked[:50]
-                              if service in node["_categories"]] + [selection, automatic]
-            # 所有节点都应可用，以确保 service 分组有实际可选的节点
+            members = [node["name"] for node in ranked[:50]
+                       if service in node["_categories"]]
+            # 实测通过的节点必须排在最前：Mihomo 默认选中第一个成员，
+            # 若把兜底组放前面，该分组会默认指向自动选择而不是实测可用节点。
+            self.assertEqual(group["proxies"][:len(members)], members)
             self.assertTrue(set(names).issubset(set(group["proxies"])))
             self.assertIn(selection, group["proxies"])
             self.assertIn(automatic, group["proxies"])

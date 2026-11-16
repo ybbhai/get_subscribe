@@ -8,11 +8,12 @@ import time
 
 import feedparser
 import requests
-import schedule
 import yaml
+from urllib3.util.retry import Retry
 
 from utils.utils import test_nodes, v2ray_2_clash, SSLAdapter, clean_yaml_content, parse_special_clash, filter_proxies, \
-    test_proxy_telnet_async, test_proxies_async
+    test_proxies_async
+from utils.clash_manager import GENERATED_PROXY_CONFIG, read_listen_ports
 
 requests.packages.urllib3.disable_warnings()
 
@@ -25,9 +26,15 @@ logger = logging.getLogger(__name__)
 
 ok_code = [200, 201, 202, 203, 204, 205, 206]
 
-# 邮箱域名过滤列表
-blackhole_list = ["cnr.cn", "cyberpolice.cn", "gov.cn", "samr.gov.cn",
-                  "12321.cn", "miit.gov.cn", "chinatcc.gov.cn"]
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "log")
+
+# 主 Clash 实例（用于拉取订阅时走本地代理）
+MAIN_PROXY_CONFIG = "proxy.yaml"
+# proxy.yaml 里写的是 external-controller: 127.0.0.1:9099 / mixed-port: 7890，
+# 这里只作为 read_listen_ports() 的兜底默认值使用。
+MAIN_CONTROLLER_PORT = 9099
+MAIN_MIXED_PORT = 7890
 
 
 def write_log(content, level="INFO"):
@@ -35,26 +42,27 @@ def write_log(content, level="INFO"):
     date_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
     update_log = f"[{date_str}] [{level}] {content}"
     logger.log(getattr(logging, level, logging.INFO), content)
-    log_dir = './log'
-    os.makedirs(log_dir, exist_ok=True)
-    with open(f'{log_dir}/{time.strftime("%Y-%m", time.localtime(time.time()))}-update.log', 'a',
+    # 日志目录必须基于脚本位置，否则从其他工作目录启动时会写到意外位置
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(os.path.join(LOG_DIR, f'{time.strftime("%Y-%m", time.localtime(time.time()))}-update.log'), 'a',
               encoding="utf-8") as f:
         f.write(update_log + "\n")
 
 
-def get_subscribe_proxies(use_local_proxy=True):
+def get_subscribe_proxies(use_local_proxy=True, proxy_port=None):
     dirs = './subscribe'
     if not os.path.exists(dirs):
         os.makedirs(dirs)
     log_dir = "./log"
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
+    port = proxy_port or MAIN_MIXED_PORT
     old_http = os.environ.get('HTTP_PROXY')
     old_https = os.environ.get('HTTPS_PROXY')
 
     if use_local_proxy:
-        os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7890'
-        os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7890'
+        os.environ['HTTP_PROXY'] = f'http://127.0.0.1:{port}'
+        os.environ['HTTPS_PROXY'] = f'http://127.0.0.1:{port}'
 
     rss = None
     try:
@@ -96,14 +104,16 @@ def get_subscribe_proxies(use_local_proxy=True):
             try:
                 v2ray_req = requests.get(v2ray_url, timeout=30)
             except requests.exceptions.RequestException as e:
+                # 单个订阅源失败不能终止整个采集流程，否则后续 URL/节点全部丢失
                 logger.error("请求 v2ray 订阅失败：%s", e)
-                return proxies
-            v2ray_code = v2ray_req.status_code
-            if v2ray_code not in ok_code:
-                write_log(f"获取 v2ray 订阅失败：{v2ray_url} - {v2ray_code}", "WARN")
+                write_log(f"请求 v2ray 订阅失败：{v2ray_url}", "WARN")
             else:
-                update_list.append(f"v2ray: {v2ray_code}")
-                proxies.extend(v2ray_2_clash(content=v2ray_req.text))
+                v2ray_code = v2ray_req.status_code
+                if v2ray_code not in ok_code:
+                    write_log(f"获取 v2ray 订阅失败：{v2ray_url} - {v2ray_code}", "WARN")
+                else:
+                    update_list.append(f"v2ray: {v2ray_code}")
+                    proxies.extend(v2ray_2_clash(content=v2ray_req.text))
     clash_list = re.findall(r">clash -&gt; (.*?)</span>", summary)
     # 获取clash订阅链接
     if any(clash_list) and not clash_list[-1].startswith("订阅地址生成失败"):
@@ -115,22 +125,24 @@ def get_subscribe_proxies(use_local_proxy=True):
             try:
                 clash_req = requests.get(clash_url, timeout=30)
             except requests.exceptions.RequestException as e:
+                # 同上：clash 订阅失败不应丢弃已解析出的 v2ray 节点
                 logger.error("请求 clash 订阅失败：%s", e)
-                return proxies
-            clash_code = clash_req.status_code
-            if clash_code not in ok_code:
-                write_log(f"获取 clash 订阅失败：{clash_url} - {clash_code}", "WARN")
+                write_log(f"请求 clash 订阅失败：{clash_url}", "WARN")
             else:
-                update_list.append(f"clash: {clash_code}")
-                clash_content = clash_req.content.decode("utf-8")
-                try:
-                    parsed = yaml.safe_load(clash_content)
-                    if parsed and "proxies" in parsed:
-                        proxies.extend(parsed["proxies"])
-                    else:
-                        logger.warning("clash 订阅内容中无 proxies 字段，跳过: %s", clash_url)
-                except yaml.YAMLError as e:
-                    logger.error("解析 clash 订阅 YAML 失败（%s）: %s", clash_url, e)
+                clash_code = clash_req.status_code
+                if clash_code not in ok_code:
+                    write_log(f"获取 clash 订阅失败：{clash_url} - {clash_code}", "WARN")
+                else:
+                    update_list.append(f"clash: {clash_code}")
+                    clash_content = clash_req.content.decode("utf-8")
+                    try:
+                        parsed = yaml.safe_load(clash_content)
+                        if parsed and "proxies" in parsed:
+                            proxies.extend(parsed["proxies"])
+                        else:
+                            logger.warning("clash 订阅内容中无 proxies 字段，跳过: %s", clash_url)
+                    except yaml.YAMLError as e:
+                        logger.error("解析 clash 订阅 YAML 失败（%s）: %s", clash_url, e)
     logger.info("RSS 订阅获取结果: %s，共 %d 个节点", update_list, len(proxies))
     return proxies
 
@@ -146,7 +158,7 @@ def load_urls(config_path):
     return urls
 
 
-def get_clash_proxies(use_local_proxy=True):
+def get_clash_proxies(use_local_proxy=True, proxy_port=None):
     # 获取当前时间，并转换成yyyyMMdd格式的字符串
     now = time.localtime(time.time())
     day = time.strftime('%d', now)
@@ -157,78 +169,134 @@ def get_clash_proxies(use_local_proxy=True):
     # 从配置文件读取URL
     config_path = os.path.join(os.path.dirname(__file__), 'config', 'urls.txt')
     urls = load_urls(config_path)
+    port = proxy_port or MAIN_MIXED_PORT
     clash_proxies = {
-        'http': 'http://127.0.0.1:7890',
-        'https': 'http://127.0.0.1:7890'
+        'http': f'http://127.0.0.1:{port}',
+        'https': f'http://127.0.0.1:{port}'
     }
 
     proxies = []
-    # 创建session并配置SSL适配器、超时、重试策略
+    # 创建 session 并配置 SSL 适配器、超时、重试策略
     session = requests.Session()
     if use_local_proxy:
         session.proxies = clash_proxies
-    session.mount("https://", SSLAdapter())
+    retry = Retry(total=3, connect=3, read=3, backoff_factor=0.5,
+                  status_forcelist=(429, 500, 502, 503, 504))
+    session.mount("https://", SSLAdapter(max_retries=retry))
+    session.mount("http://", SSLAdapter(max_retries=retry))
     # 设置超时时间（连接超时5秒，读取超时10秒）
     timeout = (5, 10)
-    for url in urls:
-        url = url.format(stamp=stamp, year=year, month=month, day=day)
-        # 获取链接文件内容
-        content = None
-        raw_content = None
-        try:
-            req = session.get(url,
-                              timeout=timeout,
-                              headers={
-                                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
-            logger.debug("获取yaml文件结果: %s", req.status_code)
-            if req.status_code in ok_code:
-                raw_content = req.content.decode("utf-8")
-                content = clean_yaml_content(raw_content)
-                parsed = yaml.safe_load(content)
-                if parsed and "proxies" in parsed:
-                    proxies.extend(parsed["proxies"])
+    try:
+        for url in urls:
+            url = url.format(stamp=stamp, year=year, month=month, day=day)
+            # 获取链接文件内容
+            raw_content = None
+            try:
+                req = session.get(url,
+                                  timeout=timeout,
+                                  headers={
+                                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"})
+                logger.debug("获取yaml文件结果: %s", req.status_code)
+                if req.status_code in ok_code:
+                    raw_content = req.content.decode("utf-8")
+                    content = clean_yaml_content(raw_content)
+                    parsed = yaml.safe_load(content)
+                    if parsed and "proxies" in parsed:
+                        proxies.extend(parsed["proxies"])
+                    else:
+                        logger.warning("URL %s 响应中无 proxies 字段，尝试特殊解析...", url)
+                        proxies.extend(parse_special_clash(content))
+            except Exception as e:
+                if raw_content:
+                    # yaml 解析失败时，尝试特殊解析
+                    try:
+                        proxies.extend(parse_special_clash(raw_content))
+                    except Exception as e2:
+                        logger.error("获取proxy失败（特殊解析也失败）：%s 原因：%s / %s", url, e, e2)
                 else:
-                    logger.warning("URL %s 响应中无 proxies 字段，尝试特殊解析...", url)
-                    proxies.extend(parse_special_clash(content))
-        except Exception as e:
-            if raw_content:
-                # yaml 解析失败时，尝试特殊解析
-                try:
-                    proxies.extend(parse_special_clash(raw_content))
-                except Exception as e2:
-                    logger.error("获取proxy失败（特殊解析也失败）：%s 原因：%s / %s", url, e, e2)
-            else:
-                logger.error("获取proxy失败：%s 原因：%s", url, e)
+                    logger.error("获取proxy失败：%s 原因：%s", url, e)
+    finally:
+        session.close()
     return proxies
 
 
-def start_proxies():
+def _launch_clash(exe_path, config_path, log_path, wait_seconds):
+    """用指定配置启动一个 Clash 进程，并轮询 API 确认就绪。
+
+    成功返回 (proc, mixed_port)，失败返回 (None, None) 并已清理进程。
+    controller/mixed 端口直接从配置文件读取，因为生成配置用 9090/7890，
+    而 proxy.yaml 用 9099/7890，写死会导致“进程已就绪却轮询不到”的假失败。
     """
-    启动主 Clash 实例（用于订阅拉取时走本地代理）。
-    若二进制不存在或启动失败，返回 None，main() 中需做 if proc 保护。
+    controller_port, mixed_port = read_listen_ports(
+        config_path, MAIN_CONTROLLER_PORT, MAIN_MIXED_PORT)
+    try:
+        with open(log_path, "w", encoding="utf-8") as log_handle:
+            proc = subprocess.Popen(
+                [exe_path, "-f", config_path],
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+    except OSError as e:
+        logger.error("启动 Clash 进程失败（%s）: %s", config_path, e)
+        return None, None
+
+    api_url = f"http://127.0.0.1:{controller_port}/version"
+    for _ in range(wait_seconds * 2):
+        if proc.poll() is not None:
+            logger.error("Clash 进程提前退出（exit_code=%s），配置: %s",
+                         proc.returncode, config_path)
+            return None, None
+        try:
+            if requests.get(api_url, timeout=1).status_code == 200:
+                return proc, mixed_port
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(0.5)
+
+    logger.error("Clash API 在 %d 秒内未就绪，终止进程: %s", wait_seconds, config_path)
+    stop_proxies(proc)
+    return None, None
+
+
+def start_proxies():
+    """启动主 Clash 实例（用于订阅拉取时走本地代理）。
+
+    配置选择顺序：
+      1. ``clash/proxy_generated.yaml``（上次生成的真实节点配置）——用它拉订阅
+         才能访问被墙的订阅源，是引入该文件的主要目的；
+      2. ``clash/proxy.yaml``（默认直连兜底配置）。
+
+    生成配置带 1 万多条规则且依赖 geoip.metadb，首次启动需要联网下载 geo 数据，
+    因此给它更长的等待时间；若它启动失败则回退到 proxy.yaml，避免整次采集没有代理。
+
+    返回 (proc, mixed_port)；无法启动时返回 (None, None)，main() 需做保护。
     """
     path = os.path.join(os.path.dirname(__file__), "clash")
     exe = "linux-compatible" if os.name != "nt" else "windows-compatible.exe"
     exe_path = os.path.join(path, exe)
     if not os.path.isfile(exe_path):
         logger.error("Clash 可执行文件不存在: %s，跳过订阅拉取", exe_path)
-        return None
-    try:
-        with open(os.path.join(path, "clash.log"), "w", encoding="utf-8") as log_handle:
-            proc = subprocess.Popen(
-                [exe_path, "-f", os.path.join(path, "proxy.yaml")],
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-            )
-    except OSError as e:
-        logger.error("启动 Clash 进程失败: %s", e)
-        return None
-    for _ in range(20):
-        if proc.poll() is not None:
-            logger.error("主 Clash 进程提前退出（exit_code=%s）", proc.returncode)
-            return None
-        time.sleep(1)
-    return proc
+        return None, None
+
+    # 生成配置优先；它含真实节点，但启动更慢（需下载 geo 数据）
+    candidates = [
+        (os.path.join(path, GENERATED_PROXY_CONFIG), 60),
+        (os.path.join(path, MAIN_PROXY_CONFIG), 10),
+    ]
+    log_path = os.path.join(path, "clash.log")
+    for config_path, wait_seconds in candidates:
+        if not os.path.isfile(config_path) or os.path.getsize(config_path) == 0:
+            logger.debug("配置缺失或为空，跳过: %s", config_path)
+            continue
+        logger.info("尝试使用配置启动本地代理: %s", os.path.basename(config_path))
+        proc, mixed_port = _launch_clash(exe_path, config_path, log_path, wait_seconds)
+        if proc:
+            logger.info("主 Clash 已就绪（%s），HTTP 端口 %s",
+                        os.path.basename(config_path), mixed_port)
+            return proc, mixed_port
+
+    logger.warning("未能启动任何本地代理配置，将直连拉取订阅")
+    return None, None
 
 
 def stop_proxies(proc):
@@ -243,17 +311,19 @@ def stop_proxies(proc):
 
 
 def main(env, dirs):
-    proc = start_proxies()
+    proc, proxy_port = start_proxies()
     proxies = []
     try:
         if proc is None:
             logger.warning("主 Clash 未启动，仍尝试获取可直连订阅源")
         try:
-            proxies.extend(get_subscribe_proxies(use_local_proxy=proc is not None) or [])
+            proxies.extend(get_subscribe_proxies(use_local_proxy=proc is not None,
+                                                proxy_port=proxy_port) or [])
         except Exception as e:
             logger.error("获取 RSS 订阅节点时发生未预期异常: %s", e, exc_info=True)
         try:
-            proxies.extend(get_clash_proxies(use_local_proxy=proc is not None))
+            proxies.extend(get_clash_proxies(use_local_proxy=proc is not None,
+                                             proxy_port=proxy_port))
         except Exception as e:
             logger.error("获取 Clash 订阅节点时发生未预期异常: %s", e, exc_info=True)
     finally:
@@ -277,6 +347,8 @@ def main(env, dirs):
     if available_proxies:
         available_proxies = test_nodes(available_proxies, env, dirs, timeout)
     logger.info("可用节点总数: %d", len(available_proxies))
+    # 回传结果，便于入口/调用方判断本次是否真的产出了配置
+    return available_proxies
 
 
 def parse_command_args():
@@ -324,23 +396,22 @@ if __name__ == '__main__':
     env = "dev"
     if "profile" in args and args["profile"]:
         env = args["profile"]
-    dirs = os.path.join(os.path.dirname(__file__), "clash")
+    # 默认输出到 subscribe/，与 README 描述的 subscribe/clash.yaml 保持一致
+    dirs = os.path.join(os.path.dirname(__file__), "subscribe")
     if "directory" in args and args["directory"]:
         dirs = args["directory"]
 
-    # # 定时任务，每三小时执行一次，初次运行时也启动
-    schedule.every(3).hours.do(main, env, dirs).run()
-    while True:
-        schedule.run_pending()
-        time.sleep(3)
-    # dirs = './subscribe'
-    # v2ray_2_clash(dirs + '/v2ray.txt')
-    # main(env, dirs)
+    # 单次执行。定时调度交给外部调度器（cron / GitHub Actions schedule）。
+    # 原实现 schedule...run() 会立即执行一次并注册任务，随后的 while True 永不退出，
+    # 在 CI 上会把整个 job 跑到超时，后面的 git commit 永远执行不到。
+    try:
+        results = main(env, dirs)
+    except Exception:
+        logger.exception("订阅更新流程异常中止")
+        raise SystemExit(1)
 
-    # get_clash_proxies()
-
-    # dirs = "./clash/test_config.yaml"
-    # with open(dirs, encoding="utf-8") as f:
-    #     base_config = yaml.safe_load(f)
-    # result = test_nodes(base_config["proxies"])
-    # print(result)
+    if results:
+        logger.info("本次更新完成，可用节点 %d 个，环境 %s，输出目录 %s", len(results), env, dirs)
+    else:
+        logger.error("本次更新未产出任何可用节点，未写入配置")
+        raise SystemExit(2)
