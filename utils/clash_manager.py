@@ -75,6 +75,21 @@ def _normalize_proxies(proxies):
     return normalized
 
 
+def select_export_proxies(proxies, limit=50):
+    selected_indexes = set()
+    required = {"google", "youtube", "chatgpt"}
+    for categories in (required, {"google"}, {"youtube"}, {"chatgpt"}):
+        candidate = next((index for index, proxy in enumerate(proxies)
+                          if categories.issubset(proxy.get("_categories", set()))), None)
+        if candidate is not None and len(selected_indexes) < limit:
+            selected_indexes.add(candidate)
+    for index in range(len(proxies)):
+        if len(selected_indexes) >= limit:
+            break
+        selected_indexes.add(index)
+    return [proxy for index, proxy in enumerate(proxies) if index in selected_indexes]
+
+
 class ClashMetaManager:
     def __init__(self, base, test, controller_port=9090, http_port=7890, socks_port=7891,
                  secret="test-secret", log_file="clash.log"):
@@ -225,18 +240,19 @@ class ClashMetaManager:
         with open(self.base, "r", encoding="utf-8") as f:
             base_config = yaml.safe_load(f)
 
-        proxies = _normalize_proxies(proxies)[:50]
+        proxies = select_export_proxies(_normalize_proxies(proxies))
         base_config["proxies"] = [
             {key: value for key, value in proxy.items() if not key.startswith("_")}
             for proxy in proxies
         ]
-        proxy_names = [p["name"] for p in proxies]
         groups = base_config.get("proxy-groups")
         if groups is None:
             logger.warning("save_config: base 配置中无 proxy-groups，跳过组更新")
             groups = []
         selection = next((group["name"] for group in groups if "节点选择" in group["name"]), None)
         automatic = next((group["name"] for group in groups if "自动选择" in group["name"]), None)
+        global_names = [proxy["name"] for proxy in proxies
+                if {"google", "youtube", "chatgpt"}.issubset(proxy.get("_categories", set()))]
         for group in groups:
             group_type = group.get("type", "")
             group_name = group.get("name", "")
@@ -245,24 +261,34 @@ class ClashMetaManager:
             if service:
                 members = [proxy["name"] for proxy in proxies
                            if service in proxy.get("_categories", set())]
-                # 实测通过的节点优先，其后才是"节点选择"、"自动选择"兜底。
-                # 顺序很关键：Mihomo 默认选中第一个成员，若把兜底组放前面，
-                # 该分组会默认指向自动选择而不是实测可用的节点。
-                all_names = list(dict.fromkeys(members + proxy_names +
-                    [name for name in (selection, automatic) if name]))
-                group["proxies"] = all_names or ["DIRECT"]
-                group["type"] = "select"
-                group.pop("url", None)
-                group.pop("interval", None)
+                group["proxies"] = members or ["REJECT"]
+                group["type"] = "url-test" if members else "select"
+                if members:
+                    group.update({
+                        "url": {
+                            "google": "https://www.google.com/generate_204",
+                            "youtube": "https://www.youtube.com",
+                            "chatgpt": "https://chatgpt.com/api/auth/providers",
+                        }[service],
+                        "expected-status": 204 if service == "google" else 200,
+                        "interval": 120, "timeout": 6000, "lazy": False,
+                        "tolerance": 50,
+                    })
+                else:
+                    for key in ("url", "interval", "expected-status", "timeout", "lazy", "tolerance"):
+                        group.pop(key, None)
                 continue
             if group_type == "select" and "节点选择" in group_name:
                 group["proxies"] = list(dict.fromkeys(
-                    ([automatic] if automatic else []) + group.get("proxies", []) + proxy_names))
+                    ([automatic] if automatic else []) + global_names)) or ["REJECT"]
             elif group_type == "url-test":
-                group["proxies"] = proxy_names or ["DIRECT"]
+                group["proxies"] = global_names or ["REJECT"]
+                group.update({"url": "https://www.gstatic.com/generate_204",
+                              "expected-status": 204, "interval": 120,
+                              "timeout": 6000, "lazy": False, "tolerance": 50})
             elif group_type == "select" and selection in group.get("proxies", []):
                 group["proxies"] = list(dict.fromkeys(group["proxies"] +
-                    ([automatic] if automatic else []) + proxy_names))
+                    ([automatic] if automatic else []) + global_names))
 
         global_group = next((group for group in groups if group.get("name") == "GLOBAL"), None)
         if global_group is None:
@@ -270,11 +296,8 @@ class ClashMetaManager:
             groups.append(global_group)
         global_group["type"] = "select"
         global_group["include-all"] = False
-        # GLOBAL 必须按模板顺序列出全部代理组，再追加具体节点。
-        # OpenClash 内置面板（metacubexd）用 GLOBAL.all 的下标给代理组排序，
-        # 不在 GLOBAL.all 中的组会被排到最前面，导致"节点选择/自动选择"被挤到末尾。
-        group_names = [group["name"] for group in groups if group.get("name") != "GLOBAL"]
-        global_group["proxies"] = list(dict.fromkeys(group_names + proxy_names)) or ["DIRECT"]
+        global_group["proxies"] = list(dict.fromkeys(
+            [name for name in (selection, automatic) if name] + global_names)) or ["REJECT"]
         base_config["proxy-groups"] = groups
         base_config.setdefault("profile", {})["store-selected"] = True
 

@@ -15,7 +15,7 @@ import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
 
-from utils.clash_manager import ClashMetaManager, _normalize_proxies
+from utils.clash_manager import ClashMetaManager, _normalize_proxies, select_export_proxies
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +353,10 @@ async def test_link_async(
             success = 200 <= response.status < 300 and (
                 final_host == target_host or final_host.endswith("." + target_host)
             )
+            if link in ("https://www.gstatic.com/generate_204", "https://www.google.com/generate_204"):
+                success = success and response.status == 204
+            if link == "https://speed.cloudflare.com/__down?bytes=1048576":
+                success = success and downloaded_bytes == 1024 * 1024
             if success and link == "https://chatgpt.com/api/auth/providers":
                 try:
                     providers = json.loads(response_body)
@@ -454,9 +458,9 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
 
     # 定义测试链接（针对不同类型的服务）
     test_links = [
-        ("google", "https://www.google.com"),
+        ("google", "https://www.google.com/generate_204"),
         ("youtube", "https://www.youtube.com"),
-        ("chatgpt", "https://chatgpt.com"),
+        ("chatgpt", "https://chatgpt.com/api/auth/providers"),
         ("github", "https://github.com"),
     ]
 
@@ -472,6 +476,8 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
         "github_speed_kbps": 0,
         "avg_latency": None,
         "avg_speed_kbps": 0,
+        "health_check_passed": False,
+        "download_passed": False,
         "is_available": False,
     }
 
@@ -496,29 +502,26 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
                 results[f"{service}_latency"] = round(elapsed * 1000, 1)  # 转为毫秒
                 results[f"{service}_speed_kbps"] = round(speed_kbps, 1)
 
-        if results["chatgpt_latency"] is None:
-            auth_results = await test_links_concurrent(
-                ["https://chatgpt.com/api/auth/providers"],
-                proxies, timeout=timeout, max_concurrent=1
-            )
-            for _, success, elapsed, downloaded_bytes in auth_results:
-                if success:
-                    results["chatgpt_latency"] = round(elapsed * 1000, 1)
-                    results["chatgpt_speed_kbps"] = round(
-                        downloaded_bytes * 8 / elapsed / 1000, 1) if elapsed > 0 else 0
-
         # 计算平均延时和速度
         latencies = [results[f"{s}_latency"] for s in ["google", "youtube", "chatgpt", "github"] if results.get(f"{s}_latency")]
         if latencies:
             results["avg_latency"] = round(sum(latencies) / len(latencies), 1)
-        results["is_available"] = any(results.get(f"{s}_latency") is not None for s in ["google", "youtube", "chatgpt"])
-        if results["is_available"]:
+        service_available = any(results.get(f"{s}_latency") is not None for s in ["google", "youtube", "chatgpt"])
+        results["is_available"] = service_available
+        if service_available:
+            health_results = await test_links_concurrent(
+                ["https://www.gstatic.com/generate_204"],
+                proxies, timeout=timeout, max_concurrent=1
+            )
+            results["health_check_passed"] = any(success for _, success, _, _ in health_results)
+        if service_available:
             speed_results = await test_links_concurrent(
                 ["https://speed.cloudflare.com/__down?bytes=1048576"],
                 proxies, timeout=timeout, max_concurrent=1
             )
             for _, success, elapsed, downloaded_bytes in speed_results:
-                if success and elapsed > 0:
+                if success and elapsed > 0 and downloaded_bytes == 1024 * 1024:
+                    results["download_passed"] = True
                     results["avg_speed_kbps"] = round(downloaded_bytes * 8 / elapsed / 1000, 1)
 
     except Exception as e:
@@ -533,11 +536,9 @@ async def test_proxy_telnet_async(proxy, timeout=5):
     port = proxy.get("port")
     if not server or port is None:
         return None
-    # IPv6 裸字面量需加方括号，否则 asyncio.open_connection 解析失败
-    if ':' in server and not server.startswith('['):
-        host = f"[{server}]"
-    else:
-        host = server
+    if proxy.get("type", "").lower() in ("hysteria", "hysteria2", "tuic"):
+        return proxy
+    host = server.strip('[]')
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
@@ -762,7 +763,7 @@ def test_nodes(proxies, env, dirs, timeout=6):
 
     # 按性能排序
     if results:
-        results = sort_proxies_by_performance(results)[:50]
+        results = select_export_proxies(sort_proxies_by_performance(results))
         logger.info("节点已按性能排序（延迟低、速度快的在前）")
 
     if env != "dev" and results:
