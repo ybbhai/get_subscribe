@@ -42,7 +42,7 @@ jobs:
         # 裸跑 python main.py 会落到 dev 环境而不导出配置，必须显式指定 prod 与输出目录
         PYTHONUNBUFFERED: '1'
       run: |
-        python main.py -p prod -d ./subscribe
+        python main.py -p prod -d ./subscribe --once
 
     - name: 提交更改
       run: |

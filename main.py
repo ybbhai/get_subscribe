@@ -3,7 +3,9 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import subprocess
+import threading
 import time
 
 import feedparser
@@ -35,6 +37,9 @@ MAIN_PROXY_CONFIG = "proxy.yaml"
 # 这里只作为 read_listen_ports() 的兜底默认值使用。
 MAIN_CONTROLLER_PORT = 9099
 MAIN_MIXED_PORT = 7890
+
+# 默认循环间隔（小时）。README 与 CI cron 都是 2 小时一轮。
+DEFAULT_INTERVAL_HOURS = 2.0
 
 
 def write_log(content, level="INFO"):
@@ -377,14 +382,84 @@ def parse_command_args():
         help='目标目录路径，例如 ./data 或 /home/user/dir'
     )
 
+    parser.add_argument(
+        '--interval',  # 循环间隔（小时）
+        type=float,
+        required=False,
+        default=DEFAULT_INTERVAL_HOURS,
+        help=f'循环执行的间隔小时数，默认 {DEFAULT_INTERVAL_HOURS:g}（仅在不带 --once 时生效）'
+    )
+
+    parser.add_argument(
+        '--once',  # 只跑一次，供 cron / CI 使用
+        action='store_true',
+        help='只执行一次后退出（CI / 外部 cron 场景），默认是定时循环执行'
+    )
+
     # 3. 解析参数（自动处理参数顺序，忽略顺序差异）
     args = parser.parse_args()
 
     # 4. 转换为字典（方便使用）
     return {
         'profile': args.profile,
-        'directory': args.directory
+        'directory': args.directory,
+        'interval': args.interval,
+        'once': args.once,
     }
+
+
+def run_round(env, dirs):
+    """执行一轮完整的订阅采集与测速，返回可用节点列表。
+
+    异常向上抛出，由调用方决定是直接退出（--once）还是继续下一轮（循环模式）。
+    """
+    results = main(env, dirs)
+    if results:
+        logger.info("本次更新完成，可用节点 %d 个，环境 %s，输出目录 %s",
+                    len(results), env, dirs)
+    else:
+        logger.error("本次更新未产出任何可用节点，未写入配置")
+    return results
+
+
+def install_stop_handlers(stop_event):
+    """注册 SIGINT/SIGTERM，让常驻进程能被 systemd/docker stop 优雅结束。"""
+
+    def _handler(signum, _frame):
+        logger.info("收到退出信号 %s，本轮结束后停止循环", signum)
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            # 非主线程或平台不支持该信号时忽略
+            logger.debug("注册信号 %s 失败，忽略", sig)
+
+
+def wait_next_round(seconds, stop_event):
+    """可被退出信号提前唤醒的等待；返回 True 表示收到退出信号。"""
+    logger.info("等待 %.1f 分钟后进行下一轮更新...", seconds / 60)
+    return stop_event.wait(seconds)
+
+
+def run_forever(env, dirs, interval_hours):
+    """定时循环执行：启动后立即跑一轮，之后每 interval_hours 小时重复一次。"""
+    interval_seconds = interval_hours * 3600
+    stop_event = threading.Event()
+    install_stop_handlers(stop_event)
+    round_no = 0
+    while not stop_event.is_set():
+        round_no += 1
+        logger.info("第 %d 轮订阅更新开始（间隔 %.1f 小时）", round_no, interval_hours)
+        try:
+            run_round(env, dirs)
+        except Exception:
+            # 单轮失败不能让常驻进程退出，否则定时更新就断了
+            logger.exception("第 %d 轮订阅更新异常，继续下一轮", round_no)
+        if wait_next_round(interval_seconds, stop_event):
+            break
+    logger.info("已停止定时循环，共执行 %d 轮", round_no)
 
 
 # 主函数入口
@@ -401,17 +476,20 @@ if __name__ == '__main__':
     if "directory" in args and args["directory"]:
         dirs = args["directory"]
 
-    # 单次执行。定时调度交给外部调度器（cron / GitHub Actions schedule）。
-    # 原实现 schedule...run() 会立即执行一次并注册任务，随后的 while True 永不退出，
-    # 在 CI 上会把整个 job 跑到超时，后面的 git commit 永远执行不到。
-    try:
-        results = main(env, dirs)
-    except Exception:
-        logger.exception("订阅更新流程异常中止")
+    interval_hours = args.get("interval") or DEFAULT_INTERVAL_HOURS
+    if interval_hours <= 0:
+        logger.error("--interval 必须大于 0，当前为 %s", interval_hours)
         raise SystemExit(1)
 
-    if results:
-        logger.info("本次更新完成，可用节点 %d 个，环境 %s，输出目录 %s", len(results), env, dirs)
+    if args.get("once"):
+        # 单次执行：供 GitHub Actions / 系统 cron 等外部调度器调用
+        try:
+            results = run_round(env, dirs)
+        except Exception:
+            logger.exception("订阅更新流程异常中止")
+            raise SystemExit(1)
+        if not results:
+            raise SystemExit(2)
     else:
-        logger.error("本次更新未产出任何可用节点，未写入配置")
-        raise SystemExit(2)
+        # 默认行为：常驻定时循环执行
+        run_forever(env, dirs, interval_hours)
