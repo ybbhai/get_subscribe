@@ -1,10 +1,12 @@
 import argparse
 import asyncio
+import ipaddress
 import logging
 import os
 import re
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -37,6 +39,7 @@ MAIN_PROXY_CONFIG = "proxy.yaml"
 # 这里只作为 read_listen_ports() 的兜底默认值使用。
 MAIN_CONTROLLER_PORT = 9099
 MAIN_MIXED_PORT = 7890
+BOOTSTRAP_CHECK_URL = "https://www.gstatic.com/generate_204"
 
 # 默认循环间隔（小时）。README 与 CI cron 都是 2 小时一轮。
 DEFAULT_INTERVAL_HOURS = 2.0
@@ -225,19 +228,89 @@ def get_clash_proxies(use_local_proxy=True, proxy_port=None):
     return proxies
 
 
-def _launch_clash(exe_path, config_path, log_path, wait_seconds):
+def _write_bootstrap_config(source_path, output_path):
+    with open(source_path, encoding="utf-8") as source:
+        exported = yaml.safe_load(source)
+    nodes = exported.get("proxies") if isinstance(exported, dict) else None
+    nodes = _filter_bootstrap_nodes(nodes)
+    if not nodes:
+        raise ValueError("上次生成的配置中没有可用的节点列表")
+
+    group_name = "SUBSCRIPTION"
+    names = [node["name"] for node in nodes]
+    while group_name in names:
+        group_name += "-"
+    config = {
+        "mixed-port": MAIN_MIXED_PORT,
+        "external-controller": f"127.0.0.1:{MAIN_CONTROLLER_PORT}",
+        "allow-lan": False,
+        "mode": "rule",
+        "proxies": nodes,
+        "proxy-groups": [{
+            "name": group_name,
+            "type": "fallback",
+            "proxies": names,
+            "url": BOOTSTRAP_CHECK_URL,
+            "interval": 60,
+            "timeout": 5000,
+            "lazy": False,
+            "expected-status": 204,
+        }],
+        "rules": [f"MATCH,{group_name}"],
+    }
+    with open(output_path, "w", encoding="utf-8") as output:
+        yaml.safe_dump(config, output, allow_unicode=True)
+
+
+def _filter_bootstrap_nodes(nodes):
+    """丢弃绑定在本机回环地址的节点，避免误用采集/测速占位配置。"""
+    if not isinstance(nodes, list):
+        return []
+    usable = []
+    rejected = 0
+    for node in nodes:
+        if not isinstance(node, dict):
+            rejected += 1
+            continue
+        host = str(node.get("server", "")).strip().lower().strip("[]")
+        is_loopback = host == "localhost" or host.endswith(".localhost")
+        try:
+            is_loopback = is_loopback or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            pass
+        if is_loopback:
+            rejected += 1
+        else:
+            usable.append(node)
+    if rejected:
+        logger.warning("忽略 %d 个无效或指向本机回环地址的采集节点", rejected)
+    return usable
+
+
+def _config_has_proxy_nodes(config_path):
+    try:
+        with open(config_path, encoding="utf-8") as source:
+            config = yaml.safe_load(source)
+    except (OSError, yaml.YAMLError):
+        return False
+    return isinstance(config, dict) and bool(config.get("proxies"))
+
+
+def _launch_clash(exe_path, config_path, log_path, wait_seconds, data_dir=None):
     """用指定配置启动一个 Clash 进程，并轮询 API 确认就绪。
 
     成功返回 (proc, mixed_port)，失败返回 (None, None) 并已清理进程。
-    controller/mixed 端口直接从配置文件读取，因为生成配置用 9090/7890，
-    而 proxy.yaml 用 9099/7890，写死会导致“进程已就绪却轮询不到”的假失败。
+    controller 和 HTTP 代理端口从实际启动配置读取。
     """
     controller_port, mixed_port = read_listen_ports(
         config_path, MAIN_CONTROLLER_PORT, MAIN_MIXED_PORT)
+    command = [exe_path, "-f", config_path]
+    if data_dir is not None:
+        command.extend(["-d", data_dir])
     try:
         with open(log_path, "w", encoding="utf-8") as log_handle:
             proc = subprocess.Popen(
-                [exe_path, "-f", config_path],
+                command,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
             )
@@ -246,59 +319,86 @@ def _launch_clash(exe_path, config_path, log_path, wait_seconds):
         return None, None
 
     api_url = f"http://127.0.0.1:{controller_port}/version"
-    for _ in range(wait_seconds * 2):
-        if proc.poll() is not None:
-            logger.error("Clash 进程提前退出（exit_code=%s），配置: %s",
-                         proc.returncode, config_path)
-            return None, None
-        try:
-            if requests.get(api_url, timeout=1).status_code == 200:
-                return proc, mixed_port
-        except requests.exceptions.RequestException:
-            pass
-        time.sleep(0.5)
+    deadline = time.monotonic() + wait_seconds
+    with requests.Session() as session:
+        session.trust_env = False
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                logger.error("Clash 进程提前退出（exit_code=%s），详情见 %s",
+                             proc.returncode, log_path)
+                return None, None
+            try:
+                if session.get(api_url, timeout=1).status_code == 200 and proc.poll() is None:
+                    return proc, mixed_port
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(0.5)
 
-    logger.error("Clash API 在 %d 秒内未就绪，终止进程: %s", wait_seconds, config_path)
+    logger.error("Clash API 在 %d 秒内未就绪，详情见 %s", wait_seconds, log_path)
     stop_proxies(proc)
     return None, None
 
 
+def _check_bootstrap_proxy(proc, port):
+    proxy_url = f"http://127.0.0.1:{port}"
+    with requests.Session() as session:
+        session.trust_env = False
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        for _ in range(3):
+            if proc.poll() is not None:
+                return False
+            try:
+                with session.get(BOOTSTRAP_CHECK_URL, timeout=5, allow_redirects=False) as response:
+                    if response.status_code == 204:
+                        return proc.poll() is None
+            except requests.exceptions.RequestException:
+                pass
+            time.sleep(1)
+    return False
+
+
 def start_proxies():
-    """启动主 Clash 实例（用于订阅拉取时走本地代理）。
-
-    配置选择顺序：
-      1. ``clash/proxy_generated.yaml``（上次生成的真实节点配置）——用它拉订阅
-         才能访问被墙的订阅源，是引入该文件的主要目的；
-      2. ``clash/proxy.yaml``（默认直连兜底配置）。
-
-    生成配置带 1 万多条规则且依赖 geoip.metadb，首次启动需要联网下载 geo 数据，
-    因此给它更长的等待时间；若它启动失败则回退到 proxy.yaml，避免整次采集没有代理。
-
-    返回 (proc, mixed_port)；无法启动时返回 (None, None)，main() 需做保护。
-    """
+    """优先用上次保存的节点启动采集代理，失败时回退到本地配置。"""
     path = os.path.join(os.path.dirname(__file__), "clash")
     exe = "linux-compatible" if os.name != "nt" else "windows-compatible.exe"
     exe_path = os.path.join(path, exe)
     if not os.path.isfile(exe_path):
-        logger.error("Clash 可执行文件不存在: %s，跳过订阅拉取", exe_path)
+        logger.error("Clash 可执行文件不存在: %s，将直连拉取订阅", exe_path)
         return None, None
 
-    # 生成配置优先；它含真实节点，但启动更慢（需下载 geo 数据）
-    candidates = [
-        (os.path.join(path, GENERATED_PROXY_CONFIG), 60),
-        (os.path.join(path, MAIN_PROXY_CONFIG), 10),
-    ]
+    source_path = os.path.join(path, GENERATED_PROXY_CONFIG)
+    bootstrap_log = os.path.join(path, "clash-bootstrap.log")
+    if os.path.isfile(source_path):
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            config_path = os.path.join(runtime_dir, "bootstrap.yaml")
+            try:
+                _write_bootstrap_config(source_path, config_path)
+            except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as error:
+                logger.warning("无法读取上次保存的节点: %s", error)
+            else:
+                proc, port = _launch_clash(exe_path, config_path, bootstrap_log, 10,
+                                           data_dir=path)
+                if proc:
+                    if _check_bootstrap_proxy(proc, port):
+                        logger.info("采集代理已通过出站检查，HTTP 端口 %s", port)
+                        return proc, port
+                    logger.warning("采集代理出站检查失败，将回退，详情见 %s", bootstrap_log)
+                    stop_proxies(proc)
+
+    config_path = os.path.join(path, MAIN_PROXY_CONFIG)
     log_path = os.path.join(path, "clash.log")
-    for config_path, wait_seconds in candidates:
-        if not os.path.isfile(config_path) or os.path.getsize(config_path) == 0:
-            logger.debug("配置缺失或为空，跳过: %s", config_path)
-            continue
-        logger.info("尝试使用配置启动本地代理: %s", os.path.basename(config_path))
-        proc, mixed_port = _launch_clash(exe_path, config_path, log_path, wait_seconds)
-        if proc:
-            logger.info("主 Clash 已就绪（%s），HTTP 端口 %s",
-                        os.path.basename(config_path), mixed_port)
+    if (os.path.isfile(config_path) and os.path.getsize(config_path) > 0
+            and _config_has_proxy_nodes(config_path)):
+        proc, mixed_port = _launch_clash(exe_path, config_path, log_path, 10)
+        if proc and _check_bootstrap_proxy(proc, mixed_port):
+            logger.info("已启动兜底配置（%s），HTTP 端口 %s",
+                        MAIN_PROXY_CONFIG, mixed_port)
             return proc, mixed_port
+        if proc:
+            logger.warning("兜底配置未能访问外网，停止代理并改为直连")
+            stop_proxies(proc)
+    elif os.path.isfile(config_path):
+        logger.warning("兜底配置没有可用代理节点，跳过代理启动")
 
     logger.warning("未能启动任何本地代理配置，将直连拉取订阅")
     return None, None
