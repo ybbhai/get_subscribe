@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import socket
 import yaml
 import subprocess
 import time
@@ -11,6 +12,44 @@ logger = logging.getLogger(__name__)
 
 # 上次生成的完整配置副本，落在 clash/ 下供下一次采集时启动本地代理使用
 GENERATED_PROXY_CONFIG = "proxy_generated.yaml"
+
+
+def _is_port_free(port):
+    """尝试监听该端口，用来判断能否分配给 Clash 实例。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def find_free_port_block(size=2, start=17000, stop=17700, step=10):
+    """找一段连续空闲端口，返回 (起始端口, 结束端口)；找不到返回 (None, None)。
+
+    不能写死 7890/7891/9090：用户本机开着代理客户端时这些端口几乎总是被占用，
+    Clash 会直接绑定失败，整批节点测试就全部作废。调用方若需要并行起多个实例，
+    请传入互不重叠的 [start, stop) 窗口，避免两个 worker 抢到同一段端口。
+    """
+    for base in range(start, stop, step):
+        ports = range(base, base + size)
+        if all(_is_port_free(port) for port in ports):
+            return base, base + size - 1
+    logger.warning("端口区间 [%s, %s) 内找不到连续 %d 个空闲端口", start, stop, size)
+    return None, None
+
+
+def _local_api_session():
+    """访问本机 Clash REST API 专用的 session。
+
+    必须 trust_env=False：本机 API 请求一旦被 HTTP_PROXY/HTTPS_PROXY 转发到
+    外部代理，就会拿到 502/超时，表现为“Clash 起不来”“节点切不过去”，
+    而实际上内核运行正常。用户的 no_proxy 不一定包含 127.0.0.1。
+    """
+    session = requests.Session()
+    session.trust_env = False
+    return session
 
 
 def read_listen_ports(config_path, default_controller=9090, default_mixed=7890):
@@ -162,19 +201,20 @@ class ClashMetaManager:
         )
         # 轮询 external-controller API 确认 Clash 已就绪
         api_url = f"{self.api}/version"
-        for _ in range(30):
-            # 提前终止：若进程已退出（配置错误、端口占用等），无需继续等待
-            if self.proc.poll() is not None:
-                logger.error("Clash 进程提前退出（exit_code=%s），config=%s",
-                             self.proc.returncode, target_path)
-                raise RuntimeError(f"Clash exited before readiness: {target_path}")
-            try:
-                r = requests.get(api_url, headers=self.headers, timeout=2)
-                if r.status_code == 200:
-                    return
-            except requests.exceptions.ConnectionError:
-                pass
-            time.sleep(1)
+        with _local_api_session() as session:
+            for _ in range(30):
+                # 提前终止：若进程已退出（配置错误、端口占用等），无需继续等待
+                if self.proc.poll() is not None:
+                    logger.error("Clash 进程提前退出（exit_code=%s），config=%s",
+                                 self.proc.returncode, target_path)
+                    raise RuntimeError(f"Clash exited before readiness: {target_path}")
+                try:
+                    r = session.get(api_url, headers=self.headers, timeout=2)
+                    if r.status_code == 200:
+                        return
+                except requests.exceptions.RequestException:
+                    pass
+                time.sleep(1)
         raise TimeoutError(f"Clash API not ready within 30 seconds: {target_path}")
 
     def stop(self):
@@ -201,42 +241,49 @@ class ClashMetaManager:
         调用方应跳过该节点的测试（避免用错误节点测数据）。
         """
         try:
-            r = requests.put(
-                f"{self.api}/proxies/TEST",
-                json={"name": proxy_name},
-                headers=self.headers,
-                timeout=3,
-            )
-            r.raise_for_status()
+            with _local_api_session() as session:
+                r = session.put(
+                    f"{self.api}/proxies/TEST",
+                    json={"name": proxy_name},
+                    headers=self.headers,
+                    timeout=3,
+                )
+                r.raise_for_status()
         except requests.exceptions.RequestException as e:
             logger.warning("switch_proxy PUT 失败（%s）: %s", proxy_name, e)
             return False
 
         # 轮询确认当前选中节点已切换为 proxy_name
         last_now = None
-        for _ in range(10):
-            try:
-                status = requests.get(
-                    f"{self.api}/proxies/TEST",
-                    headers=self.headers,
-                    timeout=2,
-                ).json()
-                last_now = status.get("now")
-                if last_now == proxy_name:
-                    return True
-            except requests.exceptions.RequestException:
-                pass
-            except (ValueError, AttributeError) as e:
-                # API 返回非 JSON 或字段缺失
-                logger.debug("switch_proxy GET 解析失败: %s", e)
-                pass
-            time.sleep(0.5)
+        with _local_api_session() as session:
+            for _ in range(10):
+                try:
+                    status = session.get(
+                        f"{self.api}/proxies/TEST",
+                        headers=self.headers,
+                        timeout=2,
+                    ).json()
+                    last_now = status.get("now")
+                    if last_now == proxy_name:
+                        return True
+                except requests.exceptions.RequestException:
+                    pass
+                except (ValueError, AttributeError) as e:
+                    # API 返回非 JSON 或字段缺失
+                    logger.debug("switch_proxy GET 解析失败: %s", e)
+                    pass
+                time.sleep(0.5)
 
         # 超时未确认切换成功，记录实际状态便于排查
         logger.warning("switch_proxy: 等待节点 %s 生效超时（当前 now=%s）", proxy_name, last_now)
         return False
 
-    def save_config(self, proxies, clash_name):
+    def save_config(self, proxies, clash_name, mirror_only=False):
+        """写出最终配置；``mirror_only=True`` 时只刷新采集缓存，不碰投放文件。
+
+        dev 模式需要刷新 clash/proxy_generated.yaml（下次启动靠它借上次的有效
+        节点），但绝不能覆盖 subscribe/clash.yaml —— 那是投放产物。
+        """
         with open(self.base, "r", encoding="utf-8") as f:
             base_config = yaml.safe_load(f)
 
@@ -304,16 +351,18 @@ class ClashMetaManager:
         target_path = clash_name
         if not os.path.isabs(target_path) and not os.path.dirname(target_path):
             target_path = os.path.join(BIN_PATH, target_path)
-        target_dir = os.path.dirname(target_path)
-        if target_dir:
-            os.makedirs(target_dir, exist_ok=True)
-        with open(target_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(base_config, f, allow_unicode=True)
+        if not mirror_only:
+            target_dir = os.path.dirname(target_path)
+            if target_dir:
+                os.makedirs(target_dir, exist_ok=True)
+            with open(target_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(base_config, f, allow_unicode=True)
 
         # 在 clash/ 下留一份副本，供下一次采集时用真实节点启动本地代理
         # （main.start_proxies 会优先读取它，见 GENERATED_PROXY_CONFIG）。
+        # 这份缓存不更新的话，下次启动永远没有可用采集节点，只能一路直连。
         mirror_path = os.path.join(BIN_PATH, GENERATED_PROXY_CONFIG)
-        if os.path.abspath(mirror_path) != os.path.abspath(target_path):
+        if mirror_only or os.path.abspath(mirror_path) != os.path.abspath(target_path):
             try:
                 with open(mirror_path, "w", encoding="utf-8") as f:
                     yaml.safe_dump(base_config, f, allow_unicode=True)

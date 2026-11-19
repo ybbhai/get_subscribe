@@ -6,10 +6,11 @@ from unittest.mock import MagicMock, Mock, patch
 import yaml
 
 from main import (
+    BOOTSTRAP_MAX_PROBE_NODES,
     acquire_instance_lock,
     _check_bootstrap_proxy,
-    _config_has_proxy_nodes,
     _filter_bootstrap_nodes,
+    _probe_subscription_via_proxy,
     _write_bootstrap_config,
     main,
 )
@@ -30,57 +31,145 @@ class BootstrapProxyTests(unittest.TestCase):
             self.assertIsNotNone(third)
             third.close()
 
-    def test_bootstrap_check_skips_bad_node_and_switches_to_available_node(self):
+    def test_bootstrap_check_uses_real_subscription_fetch_as_verdict(self):
+        """判定依据必须是真实抓订阅源，而不是 gstatic 204 探针。"""
         process = Mock()
         process.poll.return_value = None
         api_session = MagicMock()
         api_session.__enter__.return_value = api_session
-        bad_delay = Mock(status_code=503)
-        good_delay = Mock(status_code=200)
-        good_delay.json.return_value = {"delay": 145}
-        selected_group = Mock(status_code=200)
-        selected_group.json.return_value = {"now": "node-good"}
-        api_session.get.side_effect = [bad_delay, good_delay, selected_group]
         api_session.put.return_value = Mock(status_code=204)
-        proxy_session = MagicMock()
-        proxy_session.__enter__.return_value = proxy_session
-        proxy_response = Mock(status_code=204)
-        proxy_session.get.return_value.__enter__ = Mock(return_value=proxy_response)
-        proxy_session.get.return_value.__exit__ = Mock(return_value=False)
+        nodes = ["node-bad", "node-good"]
+        group_url = "http://127.0.0.1:9099/proxies/SUBSCRIPTION"
+        api_session.get.side_effect = [
+            Mock(**{"json.return_value": {"now": name}}) for name in nodes
+        ]
+        verdicts = [(False, "HTTP 502"), (True, "HTTP 200 / 4096 字节")]
+        probe = Mock(side_effect=verdicts)
 
         with patch("main.requests.Session", return_value=api_session), \
-                patch("main._subscription_session", return_value=proxy_session):
-            ready = _check_bootstrap_proxy(
-                process, 7890, "SUBSCRIPTION", ["node-bad", "node-good"])
+                patch("main._probe_targets", return_value=["https://rss.example"]), \
+                patch("main._probe_subscription_via_proxy", probe):
+            ready = _check_bootstrap_proxy(process, 7890, "SUBSCRIPTION", nodes)
 
         self.assertTrue(ready)
+        self.assertEqual(probe.call_count, 2)
+        for call in probe.call_args_list:
+            self.assertEqual(call.args[0], 7890)
+            self.assertEqual(call.args[1], ["https://rss.example"])
+        self.assertEqual(api_session.put.call_count, 2)
         self.assertEqual(api_session.put.call_args.kwargs["json"], {"name": "node-good"})
-        self.assertEqual(proxy_session.get.call_count, 1)
+        for call in api_session.put.call_args_list:
+            self.assertEqual(call.args[0], group_url)
 
-    def test_bootstrap_check_rejects_all_nodes_without_outbound_probe(self):
+    def test_bootstrap_check_honors_controller_port(self):
         process = Mock()
         process.poll.return_value = None
         api_session = MagicMock()
         api_session.__enter__.return_value = api_session
-        api_session.get.return_value = Mock(status_code=503)
-        proxy_session = MagicMock()
-        proxy_session.__enter__.return_value = proxy_session
+        api_session.get.return_value.json.return_value = {"now": "node-ok"}
 
         with patch("main.requests.Session", return_value=api_session), \
-                patch("main._subscription_session", return_value=proxy_session):
+                patch("main._probe_targets", return_value=["https://rss.example"]), \
+                patch("main._probe_subscription_via_proxy",
+                      return_value=(True, "HTTP 200")):
+            ready = _check_bootstrap_proxy(process, 17000, "SUBSCRIPTION",
+                                           ["node-ok"], controller_port=17102)
+
+        self.assertTrue(ready)
+        self.assertEqual(api_session.put.call_args.args[0],
+                         "http://127.0.0.1:17102/proxies/SUBSCRIPTION")
+
+    def test_bootstrap_check_does_not_probe_unconfirmed_switch(self):
+        process = Mock()
+        process.poll.return_value = None
+        api_session = MagicMock()
+        api_session.__enter__.return_value = api_session
+        api_session.get.return_value.json.return_value = {"now": "other-node"}
+        probe = Mock(return_value=(True, "HTTP 200"))
+
+        with patch("main.requests.Session", return_value=api_session), \
+                patch("main._probe_targets", return_value=["https://rss.example"]), \
+                patch("main._probe_subscription_via_proxy", probe):
             ready = _check_bootstrap_proxy(process, 7890, "SUBSCRIPTION", ["node-bad"])
 
         self.assertFalse(ready)
-        proxy_session.get.assert_not_called()
+        probe.assert_not_called()
 
-    def test_main_does_not_fetch_subscriptions_without_ready_proxy(self):
+    def test_probe_rejects_short_or_error_response(self):
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.get.return_value = Mock(status_code=204, content=b"\x00" * 8)
+
+        with patch("main.requests.Session", return_value=session):
+            ok, detail = _probe_subscription_via_proxy(
+                7890, ["https://example.com/sub"])
+
+        self.assertFalse(ok)
+        self.assertIn("响应过短", detail)
+        self.assertEqual(session.proxies,
+                         {"http": "http://127.0.0.1:7890",
+                          "https": "http://127.0.0.1:7890"})
+        self.assertFalse(session.trust_env)
+
+    def test_probe_accepts_real_payload(self):
+        session = MagicMock()
+        session.__enter__.return_value = session
+        payload = (
+            b"proxies:\n  - name: node\n    type: ss\n    server: proxy.example\n    port: 443\n"
+            + b"# padding\n" * 40
+        )
+        session.get.return_value = Mock(status_code=200, content=payload)
+
+        with patch("main.requests.Session", return_value=session):
+            ok, detail = _probe_subscription_via_proxy(
+                7890, ["https://example.com/sub"])
+
+        self.assertTrue(ok)
+        self.assertIn("200", detail)
+
+    def test_probe_rejects_html_challenge(self):
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.get.return_value = Mock(
+            status_code=200, content=b"<html>verification required</html>" * 20)
+
+        with patch("main.requests.Session", return_value=session):
+            ok, detail = _probe_subscription_via_proxy(
+                7890, ["https://example.com/sub"])
+
+        self.assertFalse(ok)
+        self.assertIn("不是可识别的订阅数据", detail)
+
+    def test_probe_limits_probed_nodes(self):
+        process = Mock()
+        process.poll.return_value = None
+        api_session = MagicMock()
+        api_session.__enter__.return_value = api_session
+        # 切换后 API 必须回显被切换的节点名，否则会被判成“未切换”而跳过探测
+        state = {"now": None}
+        api_session.put.side_effect = lambda _url, json=None, **_: (
+            state.update({"now": json["name"]}) or Mock(status_code=204))
+        api_session.get.side_effect = lambda *args, **kwargs: Mock(
+            **{"json.return_value": {"now": state["now"]}})
+        probe = Mock(return_value=(False, "HTTP 502"))
+        nodes = [f"node-{index}" for index in range(BOOTSTRAP_MAX_PROBE_NODES + 5)]
+
+        with patch("main.requests.Session", return_value=api_session), \
+                patch("main._probe_targets", return_value=["https://rss.example"]), \
+                patch("main._probe_subscription_via_proxy", probe):
+            ready = _check_bootstrap_proxy(process, 7890, "SUBSCRIPTION", nodes)
+
+        self.assertFalse(ready)
+        self.assertEqual(probe.call_count, BOOTSTRAP_MAX_PROBE_NODES)
+
+    def test_main_fetches_directly_without_ready_proxy(self):
         with patch("main.start_proxies", return_value=(None, None)), \
-                patch("main.get_subscribe_proxies") as get_rss, \
-                patch("main.get_clash_proxies") as get_clash:
+                patch("main.get_subscribe_proxies", return_value=[]) as get_rss, \
+                patch("main.get_clash_proxies", return_value=[]) as get_clash:
             self.assertEqual(main("dev", "unused"), [])
 
-        get_rss.assert_not_called()
-        get_clash.assert_not_called()
+        get_rss.assert_called_once_with(use_local_proxy=False, proxy_port=None)
+        get_clash.assert_called_once_with(use_local_proxy=False, proxy_port=None)
 
     def test_filter_rejects_loopback_and_keeps_remote_nodes(self):
         nodes = [
@@ -112,12 +201,15 @@ class BootstrapProxyTests(unittest.TestCase):
         self.assertEqual(config["proxy-groups"][0]["type"], "select")
 
     def test_empty_fallback_is_not_a_proxy_config(self):
+        """proxy.yaml 里没有节点时，不能拿它启动采集代理。"""
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "proxy.yaml")
             with open(path, "w", encoding="utf-8") as config_file:
                 yaml.safe_dump({"proxies": [], "rules": ["MATCH,DIRECT"]}, config_file)
 
-            self.assertFalse(_config_has_proxy_nodes(path))
+            self.assertEqual(_filter_bootstrap_nodes([]), [])
+            with self.assertRaises(ValueError):
+                _write_bootstrap_config(path, os.path.join(directory, "out.yaml"))
 
 
 if __name__ == "__main__":

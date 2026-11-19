@@ -19,7 +19,7 @@ def get_project_info(user, project, name, item, date_key, token=""):
         })
     data_list = []
     page = 0
-    date_pat = re.compile("\d{4}-\d{2}-\d{2}")
+    date_pat = re.compile(r"\d{4}-\d{2}-\d{2}")
     while True:
         page += 1
         url = f"https://api.github.com/repos/{user}/{project}/{item}?page={page}"

@@ -24,11 +24,13 @@
 - 全局模式走 GLOBAL。规则模式下修改 GLOBAL 不会改变规则指定的服务组；应在实际命中的组中选节点，或选择“节点选择”统一跟随主组。
 - 无实测节点的服务组会明确拒绝连接；需要重新生成订阅获得该服务的可用节点。可在客户端连接日志中查看命中规则和最终代理链。
 - OpenClash 的流媒体解锁检测独立于本项目的网页连通性测试。“不支持解锁”表示地区或服务授权未通过；“解锁检测失败”也可能来自超时或检测接口变化。若日志出现 `GLOBAL`，说明检测正在遍历全局候选，可能遍历到苹果服务等直连组。应在 OpenClash 中将 HBO Max 的检测目标设为实际承载规则的“国外媒体”组，Netflix 设为“NETFLIX”组，并使用规则模式。项目没有实测这些服务的播放解锁能力，节点名称中的地区或电视图标不能作为解锁凭证。
-- 生成入口 `python3 main.py -p prod -d ./subscribe` 默认为**常驻定时循环**：启动后立即执行一轮，之后每隔 `--interval` 小时（默认 12）自动重复，直到收到 SIGINT/SIGTERM。单轮失败只记录日志，不会中断循环。成功后写入 `subscribe/clash.yaml`，不是仓库已有的 `subscribe/clash.yml`，请导入或订阅正确文件。默认 dev 模式不导出最终配置，会在日志中给出提示。
+- 生成入口 `python3 main.py -p prod -d ./subscribe` 默认为**常驻定时循环**：启动后立即执行一轮，之后每隔 `--interval` 小时（默认 2）自动重复，直到收到 SIGINT/SIGTERM。单轮失败只记录日志，不会中断循环。成功后写入 `subscribe/clash.yaml`，不是仓库已有的 `subscribe/clash.yml`，请导入或订阅正确文件。默认 dev 模式不写出 `subscribe/clash.yaml`，但会刷新 `clash/proxy_generated.yaml` 采集缓存，并在日志中给出提示。
 - 若交给外部调度器（系统 cron、GitHub Actions 等）每分钟/每小时触发，请加 `--once` 只跑一次并退出，否则进程会一直驻留：`python3 main.py -p prod -d ./subscribe --once`。此时无可用节点会以退出码 2 结束，便于调度器判失败。
 - 循环模式示例：`python3 main.py -p prod -d ./subscribe --interval 6`（每 6 小时一轮）。
 - 导出时还会在 `clash/proxy_generated.yaml` 写一份同样的配置副本（内含真实节点凭据，已在 `.gitignore` 中忽略，请勿提交）。
-- 采集订阅前会先用本地 Clash 内核起一个代理，配置选择顺序为：①`clash/proxy_generated.yaml`（上次生成的真实节点，最长等 60 秒，首次启动需联网下载 geoip.metadb）；②`clash/proxy.yaml`（默认直连兜底，最长等 10 秒）。两者都不可用时才直连拉取。因此本地反复运行时，第二次起就能借上次的有效节点访问被墙的订阅源；CI 每次都是干净环境，通常会回退到 `proxy.yaml`。
+- 采集订阅前会先用本地 Clash 内核起一个代理，配置选择顺序为：①`clash/proxy_generated.yaml`（上次生成的真实节点，控制台就绪最长等 30 秒，首次启动需联网下载 geoip.metadb）；②`clash/proxy.yaml`（默认直连兜底，最长等 15 秒）。两者都不可用时才直连拉取。因此本地反复运行时，第二次起就能借上次的有效节点访问被墙的订阅源；CI 每次都是干净环境，通常会回退到 `proxy.yaml`。
+- 节点是否可用按**真实抓取订阅数据**判定：切换到该节点后，用它的本地出口去请求 RSS 源和前几条 `config/urls.txt` 订阅源，必须真的拿到可解析内容（RSS 源还要能解析出条目）才算通过。让节点访问 `generate_204` 返回 204 不算通过，那只能证明它能上网，不能证明它抓得到订阅站。每个节点有独立时间预算（最长 12 秒），最多依次尝试 12 个节点，全部失败才判定“无可用采集节点”。
+- 采集实例与测速实例的端口全部动态分配（`find_free_port_block`，区间 17000-18000 及 18000+），不写死 7890/7891/9090，避免与本机代理客户端抢端口。访问本机 Clash REST API 的请求强制 `trust_env=False`，不会被 `HTTP_PROXY`/`HTTPS_PROXY` 转发到外部代理。
 
 
 # 以下是原仓库的readme

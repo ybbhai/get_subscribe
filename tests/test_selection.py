@@ -104,8 +104,11 @@ class SelectionTests(unittest.TestCase):
         self.assertLess(rules.index(max_rule), match_index)
 
     def test_pipeline_keeps_best_fifty(self):
-        with patch("utils.utils._test_batch_nodes", side_effect=lambda batch, *args: batch):
-            result = test_nodes(list(reversed(self.make_nodes(60))), "dev", "/unused")
+        with tempfile.TemporaryDirectory() as directory:
+            cache = os.path.join(directory, "proxy_generated.yaml")
+            with patch("utils.utils._test_batch_nodes", side_effect=lambda batch, *args: batch), \
+                    patch("utils.clash_manager.GENERATED_PROXY_CONFIG", cache):
+                result = test_nodes(list(reversed(self.make_nodes(60))), "dev", directory)
         self.assertEqual(len(result), 50)
         self.assertEqual(result[0]["name"], "node-0")
         self.assertEqual(result[-1]["name"], "node-49")
@@ -133,8 +136,12 @@ class SelectionTests(unittest.TestCase):
                 for node in nodes:
                     node["_categories"] = {"google"}
                 nodes[-1]["_categories"] = categories
-                with patch("utils.utils._test_batch_nodes", side_effect=lambda batch, *args: batch):
-                    selected = test_nodes(nodes, "dev", "/unused")
+                with tempfile.TemporaryDirectory() as cache_dir:
+                    cache = os.path.join(cache_dir, "proxy_generated.yaml")
+                    with patch("utils.utils._test_batch_nodes",
+                               side_effect=lambda batch, *args: batch), \
+                            patch("utils.clash_manager.GENERATED_PROXY_CONFIG", cache):
+                        selected = test_nodes(nodes, "dev", cache_dir)
                 self.assertEqual(len(selected), 50)
                 self.assertIn("node-50", [node["name"] for node in selected])
                 with tempfile.TemporaryDirectory() as directory:

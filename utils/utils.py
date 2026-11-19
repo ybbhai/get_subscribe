@@ -15,9 +15,12 @@ import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
 
-from utils.clash_manager import ClashMetaManager, _normalize_proxies, select_export_proxies
+from utils.clash_manager import ClashMetaManager, _normalize_proxies, select_export_proxies, find_free_port_block
 
 logger = logging.getLogger(__name__)
+
+# 批量测速 worker 的端口窗口起点；每个 worker 独占 20 个端口，避免互相抢占
+_WORKER_PORT_BASE = 18000
 
 
 def b64_decode_text(raw: str) -> Optional[str]:
@@ -41,7 +44,7 @@ def b64_decode_text(raw: str) -> Optional[str]:
     try:
         return base64.b64decode(cleaned, validate=False).decode("utf-8")
     except (binascii.Error, ValueError, UnicodeDecodeError) as e:
-        logger.debug("base64 解码失败（%s...）: %s", raw[:40], e)
+        logger.debug("base64 解码失败: %s", type(e).__name__)
         return None
 
 
@@ -74,7 +77,7 @@ def decode_vmess(link):
     try:
         obj = json.loads(data)
     except ValueError as e:
-        logger.debug("vmess 节点 JSON 解析失败: %s... %s", link[:40], e)
+        logger.debug("vmess 节点 JSON 解析失败: %s", type(e).__name__)
         return None
     if not isinstance(obj, dict):
         return None
@@ -257,13 +260,13 @@ def decode_ss(link):
         else:
             credentials = b64_decode_text(userinfo)
             if not credentials:
-                logger.debug("ss 节点 userinfo 解码失败: %s...", link[:40])
+                logger.debug("ss 节点 userinfo 解码失败")
                 return None
         decoded = credentials
     else:
         decoded = b64_decode_text(raw)
         if not decoded:
-            logger.debug("ss 节点 base64 解码失败: %s...", link[:40])
+            logger.debug("ss 节点 base64 解码失败")
             return None
 
     # 标准格式：method:password@host:port；新规范：method~password@host:port（~ 开头是加密口令）
@@ -289,7 +292,7 @@ def decode_ss(link):
             "password": password,
         }
     except (ValueError, AttributeError) as e:
-        logger.debug("ss 节点格式解析失败: %s... %s", link[:40], e)
+        logger.debug("ss 节点格式解析失败: %s", type(e).__name__)
         return None
 
     plugin, plugin_opts = _ss_plugin_opts(q.get("plugin", [""])[0])
@@ -578,9 +581,19 @@ async def test_proxies_async(proxies, timeout=5, max_concurrent=200):
 
 def _test_batch_nodes(batch_proxies, dirs, timeout, worker_id):
     """批量测试：一个 Clash 实例同时测试多个节点，并记录性能指标"""
-    http_port = 7900 + worker_id * 10
-    socks_port = http_port + 1
-    controller_port = 9090 + worker_id
+    # 端口不能写死：用户本机开着代理客户端时 7890/7891/9090 基本都被占用，
+    # 采集实例绑定失败会让整批节点测试直接作废（表现为 0 个可用节点）。
+    # 每个 worker 分配一段互不重叠的端口窗口，避免并行实例互相抢端口。
+    window_start = _WORKER_PORT_BASE + worker_id * 20
+    window_stop = window_start + 20
+    http_port, socks_port = find_free_port_block(
+        size=2, start=window_start, stop=window_stop)
+    # mixed（HTTP 与 SOCKS 共用）之外的 controller 需要单独一段
+    controller_port, _ = find_free_port_block(
+        size=1, start=window_start + 10, stop=window_stop)
+    if http_port is None or controller_port is None:
+        logger.error("worker %d 找不到空闲端口，跳过该批次", worker_id)
+        return []
     config_name = f"clash_test_{worker_id}.yaml"
     log_name = f"clash_test_{worker_id}.log"
     config_path = os.path.join(dirs, config_name)
@@ -702,7 +715,9 @@ def test_nodes(proxies, env, dirs, timeout=6):
     多 Worker 设计说明：
     - 将节点按 batch_size 分批，每批内的所有节点由 1 个 Clash 实例（1 个 worker）处理
     - 不同批次之间并行执行（最多 worker_count 个 Clash 实例同时运行）
-    - 每个 worker 使用独立端口（http_port = 7900 + worker_id * 10），互不干扰
+    - 每个 worker 在互不重叠的端口窗口内动态申请空闲端口
+      （窗口 = _WORKER_PORT_BASE + worker_id * 20），避免互抢端口；
+      不能写死 7890/7891/9090，本机代理客户端通常已占用这些端口
     - 同一批内所有节点共享同一个 Clash 实例，通过 proxy-groups 切换测试
     """
     if not proxies:
@@ -766,15 +781,20 @@ def test_nodes(proxies, env, dirs, timeout=6):
         results = select_export_proxies(sort_proxies_by_performance(results))
         logger.info("节点已按性能排序（延迟低、速度快的在前）")
 
-    if env != "dev" and results:
+    if results:
         manager = ClashMetaManager('base_template.yaml', 'test_config.yaml')
-        manager.save_config(results, os.path.join(dirs, "clash.yaml"))
-    elif results:
-        # dev 模式刻意不覆盖投放文件，但必须显式提示，否则表现为"跑成功却没产物"
-        logger.warning(
-            "当前为 dev 环境，未写入 %s；如需导出请使用 -p prod",
-            os.path.join(dirs, "clash.yaml"),
-        )
+        if env != "dev":
+            manager.save_config(results, os.path.join(dirs, "clash.yaml"))
+        else:
+            # dev 模式不覆盖投放文件，但必须刷新 clash/proxy_generated.yaml：
+            # 下次启动要靠它借上次的有效节点访问被墙的订阅源。
+            # 不刷新的话缓存永远停在占位配置上，本地反复运行也只能直连。
+            manager.save_config(results, os.path.join(dirs, "clash.yaml"),
+                                mirror_only=True)
+            logger.warning(
+                "当前为 dev 环境，未写入 %s；已刷新采集缓存，如需导出请使用 -p prod",
+                os.path.join(dirs, "clash.yaml"),
+            )
 
     return results
 
@@ -819,7 +839,7 @@ def v2ray_2_clash(file_path=None, content=None):
                         proxy["name"] = f"{original_name}-{name_list[original_name]}"
                     proxies.append(proxy)
             except Exception as e:
-                logger.debug("解析失败: %s... %s", node[:40], e)
+                logger.debug("解析节点失败: %s", type(e).__name__)
     # if proxies:
     #     proxies = test_nodes(proxies)
     # print(proxies)
@@ -853,8 +873,22 @@ def filter_proxies(proxies):
         return []
     candidates = []
     for proxy in proxies:
+        if not isinstance(proxy, dict):
+            logger.debug("订阅节点不是对象，跳过: %r", proxy)
+            continue
+        port = proxy.get("port")
+        if isinstance(port, bool):
+            port = None
+        elif isinstance(port, str) and port.isdecimal():
+            try:
+                port = int(port)
+            except ValueError:
+                port = None
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            logger.debug("节点端口无效，丢弃: %s (%r)", proxy.get("name", "?"), proxy.get("port"))
+            continue
         # 必填字段缺失的节点直接丢弃
-        if proxy.get("server") is None or proxy.get("port") is None or proxy.get("type") is None:
+        if proxy.get("server") is None or proxy.get("type") is None:
             logger.debug("节点缺少必填字段（server/port/type），丢弃: %s", proxy.get("name", "?"))
             continue
         # 地址段含非法字符（如 "@@1.2.3.4"）时内核无法解析，直接丢弃
@@ -864,6 +898,7 @@ def filter_proxies(proxies):
             continue
         # 用浅拷贝避免修改调用方的原始 dict，同时清理名称中的 Unicode 编码
         proxy_copy = dict(proxy)
+        proxy_copy["port"] = port
         proxy_copy["name"] = decode_unicode_name(proxy_copy.get("name", ""))
         candidates.append(proxy_copy)
 
@@ -1003,7 +1038,7 @@ def parse_special_clash(content):
         if proxy:
             proxies.append(proxy)
         else:
-            logger.debug("第%d行解析失败（内容为空）：%s...", idx + 1, line[:80])
+            logger.debug("第%d行解析失败（内容为空）", idx + 1)
 
     return proxies
 

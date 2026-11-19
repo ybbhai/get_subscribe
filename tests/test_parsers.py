@@ -9,7 +9,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from main import RSS_URL, _extract_subscription_urls, _get_rss_proxies
+import requests
+
+from main import RSS_URL, _extract_subscription_urls, _get_rss_proxies, get_clash_proxies
 from utils.utils import (
     b64_decode_text,
     decode_ss,
@@ -74,6 +76,115 @@ class RSSSubscriptionTests(unittest.TestCase):
             "name": "node-a", "type": "ss", "server": "1.2.3.4", "port": 8388,
         }])
 
+    def test_invalid_clash_proxy_list_keeps_v2ray_results(self):
+        summary = (
+            '<a href="https://nodebuf.example/v2ray">V2Ray 订阅链接</a>'
+            '<a href="https://nodebuf.example/clash">Clash 订阅链接</a>'
+        )
+        rss_response = Mock()
+        rss_response.__enter__ = Mock(return_value=rss_response)
+        rss_response.__exit__ = Mock(return_value=False)
+        rss_response.content = b"<rss>fixture</rss>"
+        rss_response.raise_for_status = Mock()
+        v2ray_response = Mock(status_code=200, text="fixture")
+        clash_response = Mock(status_code=200, content=b"proxies: null\n")
+        session = Mock()
+        session.get.side_effect = [rss_response, v2ray_response, clash_response]
+        v2ray_nodes = [{"name": "v2ray-node", "type": "ss", "server": "1.2.3.4", "port": 443}]
+
+        with patch("main.feedparser.parse", return_value=SimpleNamespace(
+                entries=[{"summary": summary}])), \
+                patch("main.v2ray_2_clash", return_value=v2ray_nodes):
+            proxies = _get_rss_proxies(session)
+
+        self.assertEqual(proxies, v2ray_nodes)
+
+
+class ClashSubscriptionSourceTests(unittest.TestCase):
+    def test_bad_url_template_does_not_skip_later_sources(self):
+        response = Mock(
+            status_code=200,
+            content=b"proxies:\n  - name: node\n    type: ss\n    server: 1.2.3.4\n    port: 443\n",
+            headers={},
+        )
+        session = Mock()
+        session.get.return_value = response
+
+        with patch("main.load_urls", return_value=[
+                "https://invalid.example/{broken",
+                "https://valid.example/{stamp}.yaml",
+        ]), patch("main.requests.Session", return_value=session):
+            proxies = get_clash_proxies(use_local_proxy=False)
+
+        self.assertEqual([proxy["name"] for proxy in proxies], ["node"])
+        self.assertEqual(session.get.call_args.args[0].split("/")[2], "valid.example")
+
+    def test_request_failure_does_not_log_url_path_token(self):
+        secret_url = "https://feed.example/private/TOKEN?key=SECRET"
+        session = Mock()
+        session.get.side_effect = requests.exceptions.ConnectionError(
+            f"request failed: {secret_url}")
+
+        with patch("main.load_urls", return_value=[secret_url]), \
+                patch("main._subscription_session", return_value=session), \
+                self.assertLogs("main", level="WARNING") as captured:
+            self.assertEqual(get_clash_proxies(use_local_proxy=False), [])
+
+        output = "\n".join(captured.output)
+        self.assertIn("https://feed.example", output)
+        self.assertNotIn("TOKEN", output)
+        self.assertNotIn("SECRET", output)
+
+    def test_invalid_clash_encoding_keeps_v2ray_results(self):
+        summary = (
+            '<a href="https://nodebuf.example/v2ray">V2Ray 订阅链接</a>'
+            '<a href="https://nodebuf.example/clash">Clash 订阅链接</a>'
+        )
+        rss_response = Mock()
+        rss_response.__enter__ = Mock(return_value=rss_response)
+        rss_response.__exit__ = Mock(return_value=False)
+        rss_response.content = b"<rss>fixture</rss>"
+        rss_response.raise_for_status = Mock()
+        session = Mock()
+        session.get.side_effect = [
+            rss_response,
+            Mock(status_code=200, text="fixture"),
+            Mock(status_code=200, content=b"proxies: \xff"),
+        ]
+        v2ray_nodes = [{"name": "v2ray-node", "type": "ss", "server": "1.2.3.4", "port": 443}]
+
+        with patch("main.feedparser.parse", return_value=SimpleNamespace(
+                entries=[{"summary": summary}])), \
+                patch("main.v2ray_2_clash", return_value=v2ray_nodes):
+            proxies = _get_rss_proxies(session)
+
+        self.assertEqual(proxies, v2ray_nodes)
+
+    def test_request_failure_does_not_log_subscription_token(self):
+        secret_url = "https://feed.example/private/TOKEN?key=SECRET"
+        summary = f'<a href="{secret_url}">V2Ray subscription</a>'
+        rss_response = Mock()
+        rss_response.__enter__ = Mock(return_value=rss_response)
+        rss_response.__exit__ = Mock(return_value=False)
+        rss_response.content = b"<rss>fixture</rss>"
+        rss_response.raise_for_status = Mock()
+        session = Mock()
+        session.get.side_effect = [
+            rss_response,
+            requests.exceptions.ConnectionError(f"request failed: {secret_url}"),
+        ]
+
+        with patch("main.feedparser.parse", return_value=SimpleNamespace(
+                entries=[{"summary": summary}])), \
+                patch("main.write_log"), \
+                self.assertLogs("main", level="ERROR") as captured:
+            self.assertEqual(_get_rss_proxies(session), [])
+
+        output = "\n".join(captured.output)
+        self.assertIn("https://feed.example", output)
+        self.assertNotIn("TOKEN", output)
+        self.assertNotIn("SECRET", output)
+
 
 class Base64Tests(unittest.TestCase):
     def test_standard_padding(self):
@@ -95,6 +206,11 @@ class Base64Tests(unittest.TestCase):
     def test_invalid_input(self):
         self.assertIsNone(b64_decode_text(""))
         self.assertIsNone(b64_decode_text("!!!not-base64!!!"))
+
+    def test_decode_failure_does_not_log_encoded_credentials(self):
+        with self.assertLogs("utils.utils", level="DEBUG") as captured:
+            self.assertIsNone(b64_decode_text("SECRET_TOKEN!!!"))
+        self.assertNotIn("SECRET_TOKEN", "\n".join(captured.output))
 
 
 class ShadowsocksTests(unittest.TestCase):
@@ -233,6 +349,21 @@ class FilterTests(unittest.TestCase):
     def test_missing_required_field_dropped(self):
         nodes = [{"name": "bad", "type": "ss", "port": 443}]
         self.assertEqual(filter_proxies(nodes), [])
+
+    def test_port_is_range_checked_and_numeric_strings_are_normalized(self):
+        base = {"name": "node", "type": "ss", "server": "proxy.example",
+                "cipher": "aes-128-gcm", "password": "secret"}
+        valid = dict(base, port="443")
+        invalid = [dict(base, port=0), dict(base, port=65536), dict(base, port=True),
+                   dict(base, port="not-a-port"), dict(base, port="9" * 5000)]
+
+        self.assertEqual(filter_proxies([*invalid, valid])[0]["port"], 443)
+        self.assertEqual(filter_proxies(invalid), [])
+
+    def test_malformed_entries_do_not_discard_valid_nodes(self):
+        valid = {"name": "good", "type": "ss", "server": "1.2.3.4", "port": 443,
+                 "cipher": "aes-128-gcm", "password": "secret"}
+        self.assertEqual(filter_proxies([None, "invalid", valid]), [valid])
 
     def test_undialable_server_dropped(self):
         # 真实订阅里出现过 server 为 "@@168.126.234.247" 的脏节点：YAML 校验能过，
