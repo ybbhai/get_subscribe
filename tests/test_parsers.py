@@ -6,7 +6,10 @@
 
 import base64
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+from main import RSS_URL, _extract_subscription_urls, _get_rss_proxies
 from utils.utils import (
     b64_decode_text,
     decode_ss,
@@ -21,6 +24,55 @@ def urlsafe_b64(text):
     """生成不带 padding 的 urlsafe base64，模拟真实订阅里的写法。"""
     raw = base64.urlsafe_b64encode(text.encode()).decode()
     return raw.rstrip("=")
+
+
+class RSSSubscriptionTests(unittest.TestCase):
+    def test_extracts_current_clash_and_v2ray_anchor_links(self):
+        summary = (
+            '<a href="https://nodebuf.example/token/mihomo">Clash 订阅链接</a>'
+            '<a href="https://nodebuf.example/token/singbox">Sing-box 订阅链接</a>'
+            '<a href="https://nodebuf.example/token/v2ray">V2Ray 订阅链接</a>'
+        )
+        self.assertEqual(_extract_subscription_urls(summary), {
+            "clash": "https://nodebuf.example/token/mihomo",
+            "v2ray": "https://nodebuf.example/token/v2ray",
+        })
+
+    def test_keeps_legacy_text_summary_links(self):
+        summary = (
+            "<span>V2Ray/XRay -&gt; https://example.com/v2ray?token=1&amp;x=2</span>"
+            "<span>clash -&gt; https://example.com/clash.yaml</span>"
+        )
+        self.assertEqual(_extract_subscription_urls(summary), {
+            "v2ray": "https://example.com/v2ray?token=1&x=2",
+            "clash": "https://example.com/clash.yaml",
+        })
+
+    def test_current_rss_clash_link_downloads_proxy_yaml(self):
+        subscription_url = "https://nodebuf.example/token/mihomo"
+        summary = f'<a href="{subscription_url}">Clash 订阅链接</a>'
+        rss_response = Mock()
+        rss_response.__enter__ = Mock(return_value=rss_response)
+        rss_response.__exit__ = Mock(return_value=False)
+        rss_response.content = b"<rss>fixture</rss>"
+        rss_response.raise_for_status = Mock()
+
+        clash_response = Mock(
+            status_code=200,
+            content=b"proxies:\n  - name: node-a\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n",
+        )
+        session = Mock()
+        session.get.side_effect = [rss_response, clash_response]
+
+        with patch("main.feedparser.parse", return_value=SimpleNamespace(
+                entries=[{"summary": summary}])):
+            proxies = _get_rss_proxies(session)
+
+        self.assertEqual(session.get.call_args_list[0].args[0], RSS_URL)
+        self.assertEqual(session.get.call_args_list[1].args[0], subscription_url)
+        self.assertEqual(proxies, [{
+            "name": "node-a", "type": "ss", "server": "1.2.3.4", "port": 8388,
+        }])
 
 
 class Base64Tests(unittest.TestCase):
