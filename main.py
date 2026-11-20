@@ -49,7 +49,9 @@ BOOTSTRAP_MAX_PROBE_NODES = 12
 BOOTSTRAP_PROBE_TIMEOUT_SECONDS = 8
 # 单个节点的探测总预算（秒）。探针地址有多个，预算按地址数分摊而不是每个都等满，
 # 否则 12 个节点 × 4 个地址 × 8 秒会让启动卡到十分钟。
-BOOTSTRAP_NODE_BUDGET_SECONDS = 12
+# 多源探测最多 4 个 URL；12 秒预算会把单次读取压到 3 秒，
+# 实际网络稍慢时就会让每个来源都以 ReadTimeout 失败。
+BOOTSTRAP_NODE_BUDGET_SECONDS = 24
 # 启动等待：首次运行要联网下载 geoip.metadb，给足时间；兜底配置则只需快速验证
 BOOTSTRAP_LAUNCH_WAIT_SECONDS = 30
 FALLBACK_LAUNCH_WAIT_SECONDS = 15

@@ -8,6 +8,7 @@ import requests
 
 from main import (
     BOOTSTRAP_MAX_PROBE_NODES,
+    BOOTSTRAP_NODE_BUDGET_SECONDS,
     acquire_instance_lock,
     _check_bootstrap_proxy,
     _filter_bootstrap_nodes,
@@ -120,12 +121,12 @@ class BootstrapProxyTests(unittest.TestCase):
 
         with patch("main.requests.Session", return_value=session), \
                 patch("main.time.monotonic", return_value=100):
-            ok, _ = _probe_subscription_via_proxy(7890, urls, timeout=12)
+            ok, _ = _probe_subscription_via_proxy(7890, urls)
 
         self.assertFalse(ok)
         self.assertEqual(session.get.call_count, len(urls))
         self.assertEqual([call.kwargs["timeout"] for call in session.get.call_args_list],
-                         [3.0] * len(urls))
+                         [BOOTSTRAP_NODE_BUDGET_SECONDS / len(urls)] * len(urls))
 
     def test_probe_accepts_real_payload(self):
         session = MagicMock()
