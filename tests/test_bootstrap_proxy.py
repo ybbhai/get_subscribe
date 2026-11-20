@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 import yaml
+import requests
 
 from main import (
     BOOTSTRAP_MAX_PROBE_NODES,
@@ -110,6 +111,21 @@ class BootstrapProxyTests(unittest.TestCase):
                          {"http": "http://127.0.0.1:7890",
                           "https": "http://127.0.0.1:7890"})
         self.assertFalse(session.trust_env)
+
+    def test_probe_shares_node_budget_across_all_targets(self):
+        session = MagicMock()
+        session.__enter__.return_value = session
+        session.get.side_effect = requests.exceptions.ConnectTimeout
+        urls = [f"https://source-{index}.example/config" for index in range(4)]
+
+        with patch("main.requests.Session", return_value=session), \
+                patch("main.time.monotonic", return_value=100):
+            ok, _ = _probe_subscription_via_proxy(7890, urls, timeout=12)
+
+        self.assertFalse(ok)
+        self.assertEqual(session.get.call_count, len(urls))
+        self.assertEqual([call.kwargs["timeout"] for call in session.get.call_args_list],
+                         [3.0] * len(urls))
 
     def test_probe_accepts_real_payload(self):
         session = MagicMock()

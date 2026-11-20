@@ -216,6 +216,17 @@ class FallbackProxyTests(unittest.TestCase):
         self.assertGreaterEqual(len(targets), 2)
         self.assertEqual(len(targets), len(set(targets)))
 
+    def test_probe_targets_spread_across_distinct_hosts(self):
+        """相邻配置行常重复同一站点，探测名额应留给独立订阅源。"""
+        from urllib.parse import urlsplit
+
+        targets = self.main._probe_targets(limit=3)
+        hosts = [urlsplit(url).hostname for url in targets]
+
+        self.assertEqual(len(hosts), len(set(hosts)))
+        self.assertIn("raw.githubusercontent.com", hosts)
+        self.assertEqual(hosts.count("node.openclash.cc"), 1)
+
 
 class CollectRoundTests(unittest.TestCase):
     """一轮采集的兜底行为：本地代理抓不到数据时必须退回直连。"""

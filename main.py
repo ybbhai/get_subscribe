@@ -593,23 +593,41 @@ def _probe_targets(limit=3):
     第一条会让“源站今天没发”变成“所有节点都不可用”，所以多取几条提高命中率。
     """
     targets = [RSS_URL]
+    if limit <= 0:
+        return targets
     try:
         urls = load_urls(os.path.join(BASE_DIR, "config", "urls.txt"))
     except OSError as error:
         logger.warning("读取订阅源列表失败: %s", error)
         urls = []
     now = time.localtime(time.time())
-    for raw in urls[:limit]:
+    # URL 列表按站点分组时，取前几行可能重复命中同一个故障域名，
+    # 导致每个节点都测同一批不可用站点，却完全不检查后面的独立源。
+    # RSS 已占用一个探测名额；订阅源按 hostname 去重后再选，扩大故障域多样性。
+    rss_host = urlsplit(RSS_URL).hostname
+    seen_hosts = {rss_host} if rss_host else set()
+    selected_sources = 0
+    for raw in urls:
         try:
-            targets.append(raw.format(
+            url = raw.format(
                 stamp=time.strftime('%Y%m%d', now),
                 year=time.strftime('%Y', now),
                 month=time.strftime('%m', now),
                 day=time.strftime('%d', now),
-            ))
+            )
         except (KeyError, IndexError, ValueError) as error:
             logger.debug("订阅源占位符无法替换，跳过 %s: %s",
                          _redact_url(raw), type(error).__name__)
+            continue
+
+        host = urlsplit(url).hostname
+        if not host or host in seen_hosts:
+            continue
+        targets.append(url)
+        seen_hosts.add(host)
+        selected_sources += 1
+        if selected_sources >= limit:
+            break
     return list(dict.fromkeys(targets))
 
 
@@ -624,19 +642,26 @@ def _probe_subscription_via_proxy(proxy_port, urls, timeout=None):
     2 秒，避免第一个地址卡满预算后剩余地址完全没机会。
     """
     proxy_url = f"http://127.0.0.1:{proxy_port or MAIN_MIXED_PORT}"
-    deadline = time.monotonic() + (timeout or BOOTSTRAP_NODE_BUDGET_SECONDS)
+    total_budget = timeout or BOOTSTRAP_NODE_BUDGET_SECONDS
+    deadline = time.monotonic() + total_budget
     failures = []
     with requests.Session() as session:
         session.trust_env = False
         session.proxies = {"http": proxy_url, "https": proxy_url}
-        for url in urls:
+        for index, url in enumerate(urls):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 failures.append("探测预算耗尽")
                 break
+            remaining_targets = len(urls) - index
+            request_timeout = min(
+                BOOTSTRAP_PROBE_TIMEOUT_SECONDS,
+                total_budget / len(urls),
+                max(2.0, remaining / remaining_targets),
+            )
             try:
                 response = session.get(
-                    url, timeout=min(BOOTSTRAP_PROBE_TIMEOUT_SECONDS, max(2.0, remaining)),
+                    url, timeout=request_timeout,
                     headers={"User-Agent": USER_AGENT})
                 status = response.status_code
                 content = response.content
