@@ -346,11 +346,25 @@ def _get_rss_proxies(session):
         write_log("更新失败！无法拉取原网站内容", "ERROR")
         return []
     update_list = []
-    summary = entries[0].get("summary")
-    if not summary:
-        write_log("暂时没有可用的订阅更新", "WARN")
+    subscription_urls = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        fragments = [entry.get("summary", "")]
+        fragments.extend(
+            item.get("value", "")
+            for item in (entry.get("content") or [])
+            if isinstance(item, dict)
+        )
+        for fragment in fragments:
+            for kind, url in _extract_subscription_urls(fragment).items():
+                subscription_urls.setdefault(kind, url)
+        if subscription_urls:
+            break
+
+    if not subscription_urls:
+        write_log("RSS 最近条目中没有可用的订阅链接", "WARN")
         return []
-    subscription_urls = _extract_subscription_urls(summary)
     proxies = []
     # 获取普通订阅链接
     v2ray_url = subscription_urls.get("v2ray")
@@ -394,10 +408,16 @@ def _get_rss_proxies(session):
                 else:
                     update_list.append(f"clash: {clash_code}")
                     try:
-                        clash_content = clash_req.content.decode("utf-8-sig")
-                        parsed = yaml.safe_load(clash_content)
+                        clash_content = clean_yaml_content(
+                            clash_req.content.decode("utf-8-sig"))
+                        try:
+                            parsed = yaml.safe_load(clash_content)
+                        except yaml.YAMLError:
+                            parsed = None
                         clash_nodes = parsed.get("proxies") if isinstance(parsed, dict) else None
-                        if isinstance(clash_nodes, list):
+                        if not isinstance(clash_nodes, list):
+                            clash_nodes = parse_special_clash(clash_content)
+                        if clash_nodes:
                             proxies.extend(clash_nodes)
                         else:
                             logger.warning("clash 订阅内容中无有效 proxies 列表，跳过: %s",

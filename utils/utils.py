@@ -317,7 +317,7 @@ def decode_hysteria2(link):
         "type": "hysteria2",
         "server": u.hostname,
         "port": u.port,
-        "password": u.username,
+        "password": urllib.parse.unquote(u.username),
         "sni": q.get("sni", [""])[0],
         "skip-cert-verify": q.get("insecure", ["0"])[0] == "1"
     }
@@ -799,6 +799,19 @@ def test_nodes(proxies, env, dirs, timeout=6):
     return results
 
 
+def _decode_v2ray_subscription(content):
+    """接受明文 URI 列表或 Base64 编码的 URI 列表。"""
+    if not content:
+        return None
+
+    supported_schemes = ("vless://", "ss://", "vmess://", "hysteria2://")
+    if any(line.strip().lstrip("\ufeff").startswith(supported_schemes)
+           for line in content.splitlines()):
+        return content
+
+    return b64_decode_text(content)
+
+
 def v2ray_2_clash(file_path=None, content=None):
     nodes = None
     if file_path and os.path.exists(file_path):
@@ -808,17 +821,18 @@ def v2ray_2_clash(file_path=None, content=None):
             for line in f:
                 if not line:
                     continue
-                txt = b64_decode_text(line.strip())
+                txt = _decode_v2ray_subscription(line.strip())
                 if txt:
                     decoded_lines.append(txt)
         if decoded_lines:
             nodes = "\n".join(decoded_lines)
     elif content:
-        nodes = b64_decode_text(content)
+        nodes = _decode_v2ray_subscription(content)
     proxies = []
     name_list = {}  # name -> 出现次数（从1开始）
     if nodes:
         for node in nodes.splitlines():
+            node = node.strip().lstrip("\ufeff")
             try:
                 proxy = None
                 if node.startswith("vless://"):

@@ -14,11 +14,13 @@ import requests
 from main import RSS_URL, _extract_subscription_urls, _get_rss_proxies, get_clash_proxies
 from utils.utils import (
     b64_decode_text,
+    decode_hysteria2,
     decode_ss,
     decode_vless,
     decode_vmess,
     filter_proxies,
     sort_proxies_by_performance,
+    v2ray_2_clash,
 )
 
 
@@ -75,6 +77,50 @@ class RSSSubscriptionTests(unittest.TestCase):
         self.assertEqual(proxies, [{
             "name": "node-a", "type": "ss", "server": "1.2.3.4", "port": 8388,
         }])
+
+    def test_reads_content_encoded_links_and_falls_back_to_older_rss_entry(self):
+        older_summary = '<a href="https://feed.example/v2ray">V2Ray subscription</a>'
+        rss_response = Mock()
+        rss_response.__enter__ = Mock(return_value=rss_response)
+        rss_response.__exit__ = Mock(return_value=False)
+        rss_response.content = b"<rss>fixture</rss>"
+        rss_response.raise_for_status = Mock()
+        subscription_response = Mock(
+            status_code=200,
+            text=base64.b64encode(
+                b"ss://aes-128-gcm:secret@1.2.3.4:443#node"
+            ).decode(),
+        )
+        session = Mock()
+        session.get.side_effect = [rss_response, subscription_response]
+
+        with patch("main.feedparser.parse", return_value=SimpleNamespace(entries=[
+                {"summary": ""},
+                {"summary": "", "content": [{"value": older_summary}]},
+        ])):
+            proxies = _get_rss_proxies(session)
+
+        self.assertEqual(session.get.call_args_list[1].args[0], "https://feed.example/v2ray")
+        self.assertEqual([proxy["name"] for proxy in proxies], ["node"])
+
+    def test_rss_clash_parser_uses_special_format_fallback(self):
+        summary = '<a href="https://feed.example/clash">Clash subscription</a>'
+        rss_response = Mock()
+        rss_response.__enter__ = Mock(return_value=rss_response)
+        rss_response.__exit__ = Mock(return_value=False)
+        rss_response.content = b"<rss>fixture</rss>"
+        rss_response.raise_for_status = Mock()
+        clash_response = Mock(status_code=200, content=b"proxies: [malformed")
+        session = Mock()
+        session.get.side_effect = [rss_response, clash_response]
+        parsed_nodes = [{"name": "recovered", "type": "ss", "server": "1.2.3.4", "port": 443}]
+
+        with patch("main.feedparser.parse", return_value=SimpleNamespace(
+                entries=[{"summary": summary}])), \
+                patch("main.parse_special_clash", return_value=parsed_nodes):
+            proxies = _get_rss_proxies(session)
+
+        self.assertEqual(proxies, parsed_nodes)
 
     def test_invalid_clash_proxy_list_keeps_v2ray_results(self):
         summary = (
@@ -321,6 +367,30 @@ class VmessTests(unittest.TestCase):
         self.assertEqual(node["servername"], "c.com")
         self.assertEqual(node["alpn"], ["h2", "http/1.1"])
         self.assertEqual(node["grpc-opts"]["grpc-service-name"], "gsvc")
+
+
+class V2raySubscriptionTests(unittest.TestCase):
+    def test_parses_plain_text_uri_list(self):
+        content = (
+            "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?security=tls#vless\n"
+            "ss://aes-128-gcm:secret@5.6.7.8:8388#ss\n"
+        )
+
+        nodes = v2ray_2_clash(content=content)
+
+        self.assertEqual([node["type"] for node in nodes], ["vless", "ss"])
+
+    def test_parses_base64_uri_list(self):
+        content = "ss://aes-128-gcm:secret@5.6.7.8:8388#ss\n"
+
+        nodes = v2ray_2_clash(content=base64.b64encode(content.encode()).decode())
+
+        self.assertEqual([node["name"] for node in nodes], ["ss"])
+
+    def test_decodes_percent_encoded_hysteria2_password(self):
+        node = decode_hysteria2("hysteria2://password%3Awith%40symbols@example.com:443#hy2")
+
+        self.assertEqual(node["password"], "password:with@symbols")
 
 
 class FilterTests(unittest.TestCase):
