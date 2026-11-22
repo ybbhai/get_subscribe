@@ -816,6 +816,19 @@ def _stage_counts(proxies):
     return stage_counts(proxies)
 
 
+def _remove_stale_clash_config(output_dir):
+    output_path = os.path.join(output_dir, "clash.yaml")
+    try:
+        os.unlink(output_path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        logger.warning("无法删除过期的 clash.yaml（%s）: %s",
+                       type(error).__name__, output_path)
+    else:
+        logger.info("已删除过期的 clash.yaml: %s", output_path)
+
+
 def test_nodes(proxies, env, dirs, timeout=6, diagnostics=None):
     """
     批量测试节点，并发启动多个 Clash 实例。
@@ -842,6 +855,8 @@ def test_nodes(proxies, env, dirs, timeout=6, diagnostics=None):
     logger.info("节点性能门槛：完整下载 >= %.0f kbit/s，204 响应耗时 <= %.0fms",
                 policy.min_speed_kbps, policy.max_latency_ms)
     if not proxies:
+        if env == "prod":
+            _remove_stale_clash_config(dirs)
         write_selection_report([], [], policy, dirs, diagnostics=diagnostics, inspection=status)
         return []
 
@@ -851,6 +866,8 @@ def test_nodes(proxies, env, dirs, timeout=6, diagnostics=None):
                      "measure", "unsupported_core")
         proxies = [proxy for proxy in proxies if proxy.get("type") != "openvpn"]
         if not proxies:
+            if env == "prod":
+                _remove_stale_clash_config(dirs)
             diagnostics["probe_failures"] = audit.snapshot()
             write_selection_report([], [], policy, dirs, diagnostics=diagnostics, inspection=status)
             return []
@@ -935,8 +952,9 @@ def test_nodes(proxies, env, dirs, timeout=6, diagnostics=None):
                 os.path.join(dirs, "clash.yaml"),
             )
     elif env == "prod":
-        logger.warning("本轮没有通过性能与复测要求的节点，未生成新 clash.yaml；"
-                       "若目录已有旧文件，它不代表本轮结果，请查看 node_selection_report.json")
+        _remove_stale_clash_config(dirs)
+        logger.warning("本轮没有通过性能与复测要求的节点，已清除过期 clash.yaml；"
+                       "请查看 node_selection_report.json")
 
     return results
 

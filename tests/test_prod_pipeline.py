@@ -27,6 +27,17 @@ def metrics(speed=10000, latency=200, available=True):
 
 
 class ProductionPipelineTests(unittest.TestCase):
+    def test_empty_prod_round_removes_stale_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "clash.yaml"
+            output.write_text("previous output", encoding="utf-8")
+            selected = test_nodes([], "prod", directory)
+            report = json.loads((Path(directory) / "node_selection_report.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(selected, [])
+        self.assertFalse(output.exists())
+        self.assertEqual(report["selected_count"], 0)
+
     def test_budget_is_allocated_after_all_measurements_and_failed_recheck_is_rejected(self):
         nodes = [node("slow", 1000), node("unstable", 16000), node("best", 12000)]
         events = []
@@ -64,7 +75,7 @@ class ProductionPipelineTests(unittest.TestCase):
         self.assertEqual(rejected["speed_kbps"], 500)
         self.assertFalse(rejected["selected"])
 
-    def test_failed_verification_does_not_overwrite_previous_output(self):
+    def test_failed_verification_removes_stale_output(self):
         def probe(batch, *args):
             return [dict(p) for p in batch] if args[4] == "measure" else []
 
@@ -74,7 +85,7 @@ class ProductionPipelineTests(unittest.TestCase):
             with patch("utils.utils._test_batch_nodes", side_effect=probe):
                 selected = test_nodes([node("unstable")], "prod", directory)
             report = json.loads((Path(directory) / "node_selection_report.json").read_text(encoding="utf-8"))
-            self.assertEqual(output.read_text(encoding="utf-8"), "previous output")
+            self.assertFalse(output.exists())
         self.assertEqual(selected, [])
         self.assertEqual(report["selected_count"], 0)
         self.assertEqual(report["nodes"][0]["verification"], "failed")

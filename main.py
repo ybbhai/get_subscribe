@@ -28,6 +28,7 @@ from utils.cloudflare_source import (
     DEFAULT_MAX_CANDIDATES,
     CloudflareSourceError,
     get_cloudflare_proxies,
+    get_cloudflare_templates,
 )
 from utils.cloudflare_speedtest import (
     DEFAULT_MAX_CANDIDATES as DEFAULT_CF_SPEEDTEST_CANDIDATES,
@@ -998,11 +999,15 @@ def _merge_cloudflare_source(saved_source, cli_source):
     return source
 
 
-def _append_optimized_cloudflare_proxies(proxies, max_candidates, diagnostics_dir=None):
+def _append_optimized_cloudflare_proxies(proxies, max_candidates, diagnostics_dir=None,
+                                         bootstrap_proxy_url=None,
+                                         bootstrap_trust_env=False):
     """Add locally discovered Cloudflare candidates without blocking other sources."""
     try:
         cloudflare_proxies = get_optimized_cloudflare_proxies(
-            proxies, max_candidates=max_candidates, diagnostics_dir=diagnostics_dir
+            proxies, max_candidates=max_candidates, diagnostics_dir=diagnostics_dir,
+            bootstrap_proxy_url=bootstrap_proxy_url,
+            bootstrap_trust_env=bootstrap_trust_env,
         )
     except CloudflareSourceError as error:
         logger.warning("自动 Cloudflare 优选不可用，将继续使用抓取节点: %s", error)
@@ -1035,6 +1040,9 @@ def main(env, dirs, cloudflare_source=None):
 
     proxies = []
     diagnostics = {"sources": [], "stage_counts": {}}
+    max_candidates = (cloudflare_source or {}).get(
+        "automatic_max_candidates", DEFAULT_CF_SPEEDTEST_CANDIDATES
+    )
     try:
         route = f"本地 Clash 127.0.0.1:{proxy_port or MAIN_MIXED_PORT}" if proc else "直连"
         logger.info("本轮 RSS 与 Clash 订阅请求使用 %s", route)
@@ -1052,31 +1060,41 @@ def main(env, dirs, cloudflare_source=None):
             diagnostics["sources"] = []
             _collect_proxies(proxies, False, None, cloudflare_source,
                              profile=env, diagnostics=diagnostics)
-        if any(isinstance(node, dict) and node.get("type") == "openvpn" for node in proxies):
-            runtime_session = None
-            try:
-                runtime_session = _subscription_session(proc is not None, proxy_port)
-                ensure_openvpn_runtime(session=runtime_session)
-                diagnostics["openvpn_runtime"] = {"status": "ready"}
-            except Exception as error:
-                diagnostics["openvpn_runtime"] = {"status": "unavailable", "reason": type(error).__name__}
-                if isinstance(error, MihomoRuntimeError):
-                    diagnostics["openvpn_runtime"]["detail"] = str(error)
-                logger.warning("OpenVPN 内核准备失败（%s）；检测阶段会记录不支持的候选", type(error).__name__)
-            finally:
-                if runtime_session is not None:
-                    runtime_session.close()
     finally:
         stop_proxies(proc)
+        proc = None
 
-    max_candidates = (cloudflare_source or {}).get(
-        "automatic_max_candidates", DEFAULT_CF_SPEEDTEST_CANDIDATES
-    )
+    if any(isinstance(node, dict) and node.get("type") == "openvpn" for node in proxies):
+        runtime_session = None
+        try:
+            runtime_session = _subscription_session(False, None)
+            ensure_openvpn_runtime(session=runtime_session)
+            diagnostics["openvpn_runtime"] = {"status": "ready"}
+        except Exception as error:
+            diagnostics["openvpn_runtime"] = {"status": "unavailable", "reason": type(error).__name__}
+            if isinstance(error, MihomoRuntimeError):
+                diagnostics["openvpn_runtime"]["detail"] = str(error)
+            logger.warning("OpenVPN 内核准备失败（%s）；检测阶段会记录不支持的候选", type(error).__name__)
+        finally:
+            if runtime_session is not None:
+                runtime_session.close()
+
     if (cloudflare_source or {}).get("automatic_enabled", True):
-        diagnostics["sources"].append(_append_optimized_cloudflare_proxies(proxies, max_candidates, dirs))
+        bootstrap_proxy_url = (
+            _detect_fallback_proxy()
+            if get_cloudflare_templates(proxies, limit=1) else None
+        )
+        diagnostics["sources"].append(_append_optimized_cloudflare_proxies(
+            proxies, max_candidates, dirs,
+            bootstrap_proxy_url=bootstrap_proxy_url,
+            bootstrap_trust_env=bootstrap_proxy_url is None,
+        ))
     else:
-        diagnostics["sources"].append({"id": "cloudflare_auto", "type": "cloudflare_auto",
-                                       "status": "disabled", "parsed_count": 0, "accepted_count": 0})
+        diagnostics["sources"].append({
+            "id": "cloudflare_auto", "type": "cloudflare_auto",
+            "status": "disabled", "parsed_count": 0, "accepted_count": 0,
+        })
+
     diagnostics["stage_counts"]["collected"] = stage_counts(proxies)
     proxies = filter_proxies(proxies)
     diagnostics["stage_counts"]["normalized"] = stage_counts(proxies)

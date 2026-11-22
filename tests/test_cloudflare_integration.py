@@ -353,10 +353,13 @@ class CloudflareSourceTests(unittest.TestCase):
 
         optimized_inputs = []
         optimized_limits = []
+        optimized_bootstrap = []
 
-        def fake_optimize(nodes, max_candidates, diagnostics_dir=None):
+        def fake_optimize(nodes, max_candidates, diagnostics_dir=None,
+                          bootstrap_proxy_url=None, bootstrap_trust_env=False):
             optimized_inputs.append(list(nodes))
             optimized_limits.append(max_candidates)
+            optimized_bootstrap.append((bootstrap_proxy_url, bootstrap_trust_env))
             return [cloudflare_proxy]
 
         with patch("main.start_proxies", return_value=(None, None)), \
@@ -375,6 +378,7 @@ class CloudflareSourceTests(unittest.TestCase):
                           for proxy in optimized_inputs[0]], [rss_proxy])
         self.assertEqual(optimized_inputs[0][0]["_source_ids"], ["rss"])
         self.assertEqual(optimized_limits, [40])
+        self.assertEqual(optimized_bootstrap, [(None, True)])
 
 
 if __name__ == "__main__":

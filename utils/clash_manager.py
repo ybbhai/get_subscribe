@@ -141,7 +141,7 @@ def _validate_proxy_graph(config):
         raise ValueError("proxy configuration contains a reference cycle") from None
 
 
-def _atomic_write_config(config, target_path):
+def _atomic_write_config(config, target_path, *, mode=None):
     _validate_proxy_graph(config)
     directory = os.path.dirname(os.path.abspath(target_path))
     os.makedirs(directory, exist_ok=True)
@@ -154,6 +154,8 @@ def _atomic_write_config(config, target_path):
             yaml.safe_dump(config, output, allow_unicode=True)
             output.flush()
             os.fsync(output.fileno())
+        if mode is not None:
+            os.chmod(temporary, mode)
         os.replace(temporary, target_path)
     finally:
         if temporary and os.path.exists(temporary):
@@ -431,7 +433,7 @@ class ClashMetaManager:
         if not os.path.isabs(target_path) and not os.path.dirname(target_path):
             target_path = os.path.join(BIN_PATH, target_path)
         if not mirror_only:
-            _atomic_write_config(base_config, target_path)
+            _atomic_write_config(base_config, target_path, mode=0o777)
 
         # 在 clash/ 下留一份副本，供下一次采集时用真实节点启动本地代理
         # （main.start_proxies 会优先读取它，见 GENERATED_PROXY_CONFIG）。
@@ -439,7 +441,7 @@ class ClashMetaManager:
         mirror_path = os.path.join(BIN_PATH, GENERATED_PROXY_CONFIG)
         if mirror_only or os.path.abspath(mirror_path) != os.path.abspath(target_path):
             try:
-                _atomic_write_config(base_config, mirror_path)
+                _atomic_write_config(base_config, mirror_path, mode=0o777)
                 logger.info("已写入代理配置副本: %s", mirror_path)
             except OSError as e:
                 # 副本只是优化项，写失败不应影响主配置产出

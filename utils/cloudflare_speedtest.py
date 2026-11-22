@@ -48,9 +48,11 @@ CFST_DOWNLOAD_SECONDS = 5
 CFST_MAX_DOWNLOADS = 40
 
 
-def _direct_session():
+def _direct_session(proxy_url=None, *, trust_env=False):
     session = requests.Session()
-    session.trust_env = False
+    session.trust_env = trust_env
+    if proxy_url:
+        session.proxies = {"http": proxy_url, "https": proxy_url}
     session.headers.update({
         "User-Agent": "get-subscribe/1.0",
         "Accept": "application/json,text/plain,*/*",
@@ -92,12 +94,14 @@ def _parse_ipv4_networks(raw):
     return networks
 
 
-def fetch_cloudflare_ipv4_networks(cache_dir=DEFAULT_CACHE_DIR):
+def fetch_cloudflare_ipv4_networks(cache_dir=DEFAULT_CACHE_DIR, *,
+                                   bootstrap_proxy_url=None,
+                                   bootstrap_trust_env=False):
     """Fetch Cloudflare's public IPv4 ranges directly, with a local cache fallback."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / "ips-v4.txt"
-    session = _direct_session()
+    session = _direct_session(bootstrap_proxy_url, trust_env=bootstrap_trust_env)
     response = None
     try:
         response = session.get(CLOUDFLARE_IPV4_URL, timeout=(5, 15), stream=True)
@@ -122,7 +126,7 @@ def fetch_cloudflare_ipv4_networks(cache_dir=DEFAULT_CACHE_DIR):
         if isinstance(error, CloudflareSourceError):
             raise
         raise CloudflareSourceError(
-            f"无法直连获取 Cloudflare 官方 IPv4 网段（{type(error).__name__}）"
+            f"无法获取 Cloudflare 官方 IPv4 网段（{type(error).__name__}）"
         ) from None
     finally:
         if response is not None:
@@ -182,7 +186,8 @@ def _platform_asset_name(system=None, machine=None):
     )
 
 
-def _load_latest_release(cache_dir=DEFAULT_CACHE_DIR):
+def _load_latest_release(cache_dir=DEFAULT_CACHE_DIR, *, bootstrap_proxy_url=None,
+                         bootstrap_trust_env=False):
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = cache_dir / "latest-release.json"
@@ -197,7 +202,7 @@ def _load_latest_release(cache_dir=DEFAULT_CACHE_DIR):
         except (OSError, ValueError):
             cached_release = None
 
-    session = _direct_session()
+    session = _direct_session(bootstrap_proxy_url, trust_env=bootstrap_trust_env)
     response = None
     try:
         response = session.get(GITHUB_RELEASES_API, timeout=(5, 20), stream=True)
@@ -237,7 +242,8 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
-def _download_asset(asset, archive_path, expected_digest):
+def _download_asset(asset, archive_path, expected_digest, *, bootstrap_proxy_url=None,
+                    bootstrap_trust_env=False):
     digest_match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", expected_digest or "")
     if digest_match is None:
         raise CloudflareSourceError("CloudflareSpeedTest Release 缺少有效 SHA-256")
@@ -245,7 +251,7 @@ def _download_asset(asset, archive_path, expected_digest):
     if archive_path.is_file() and _sha256_file(archive_path) == expected_digest:
         return archive_path
 
-    session = _direct_session()
+    session = _direct_session(bootstrap_proxy_url, trust_env=bootstrap_trust_env)
     temporary_path = archive_path.with_suffix(archive_path.suffix + ".part")
     digest = hashlib.sha256()
     total = 0
@@ -331,8 +337,13 @@ def _extract_executable(archive_path, asset_name, version_dir):
             temporary_path.unlink()
 
 
-def _get_cloudflare_speedtest_binary(cache_dir=DEFAULT_CACHE_DIR):
-    release = _load_latest_release(cache_dir)
+def _get_cloudflare_speedtest_binary(cache_dir=DEFAULT_CACHE_DIR, *,
+                                     bootstrap_proxy_url=None,
+                                     bootstrap_trust_env=False):
+    release = _load_latest_release(
+        cache_dir, bootstrap_proxy_url=bootstrap_proxy_url,
+        bootstrap_trust_env=bootstrap_trust_env,
+    )
     asset_name = _platform_asset_name()
     asset = next(
         (item for item in release["assets"] if item.get("name") == asset_name),
@@ -348,7 +359,11 @@ def _get_cloudflare_speedtest_binary(cache_dir=DEFAULT_CACHE_DIR):
     version_dir = Path(cache_dir) / version
     version_dir.mkdir(parents=True, exist_ok=True)
     archive_path = version_dir / asset_name
-    archive_path = _download_asset(asset, archive_path, asset.get("digest"))
+    archive_path = _download_asset(
+        asset, archive_path, asset.get("digest"),
+        bootstrap_proxy_url=bootstrap_proxy_url,
+        bootstrap_trust_env=bootstrap_trust_env,
+    )
     return _extract_executable(archive_path, asset_name, version_dir)
 
 
@@ -461,7 +476,8 @@ def _scan_parameters(max_candidates):
 
 
 def _run_cloudflare_speedtest(networks, *, port, max_candidates, cache_dir,
-                              diagnostics_dir, diagnostics):
+                              diagnostics_dir, diagnostics, bootstrap_proxy_url=None,
+                              bootstrap_trust_env=False):
     validate_candidate_limit(max_candidates)
     if port != 443:
         raise CloudflareSourceError("自动 Cloudflare 优选目前只扫描 443 端口")
@@ -470,7 +486,10 @@ def _run_cloudflare_speedtest(networks, *, port, max_candidates, cache_dir,
     if not ranges_text:
         raise CloudflareSourceError("没有可供 CloudflareSpeedTest 扫描的 IPv4 网段")
 
-    executable = _get_cloudflare_speedtest_binary(cache_dir)
+    executable = _get_cloudflare_speedtest_binary(
+        cache_dir, bootstrap_proxy_url=bootstrap_proxy_url,
+        bootstrap_trust_env=bootstrap_trust_env,
+    )
     parameters = diagnostics["scan_parameters"]
     download_count = parameters["max_downloads"]
     # Downloads are sequential: 40 * the upstream 10s default exceeds the old 180s total.
@@ -529,7 +548,8 @@ def _run_cloudflare_speedtest(networks, *, port, max_candidates, cache_dir,
 
 def run_cloudflare_speedtest(networks, *, port=443,
                              max_candidates=DEFAULT_MAX_CANDIDATES,
-                             cache_dir=DEFAULT_CACHE_DIR, diagnostics_dir=None):
+                             cache_dir=DEFAULT_CACHE_DIR, diagnostics_dir=None,
+                             bootstrap_proxy_url=None, bootstrap_trust_env=False):
     validate_candidate_limit(max_candidates)
     diagnostics = {
         "status": "failed",
@@ -541,6 +561,8 @@ def run_cloudflare_speedtest(networks, *, port=443,
         addresses = _run_cloudflare_speedtest(
             networks, port=port, max_candidates=max_candidates, cache_dir=cache_dir,
             diagnostics_dir=diagnostics_dir, diagnostics=diagnostics,
+            bootstrap_proxy_url=bootstrap_proxy_url,
+            bootstrap_trust_env=bootstrap_trust_env,
         )
         diagnostics["status"] = "completed"
         diagnostics["speedtested_ingress_count"] = len(addresses)
@@ -556,7 +578,9 @@ def run_cloudflare_speedtest(networks, *, port=443,
 
 
 def get_optimized_cloudflare_proxies(proxies, *, max_candidates=DEFAULT_MAX_CANDIDATES,
-                                     cache_dir=DEFAULT_CACHE_DIR, diagnostics_dir=None):
+                                     cache_dir=DEFAULT_CACHE_DIR, diagnostics_dir=None,
+                                     bootstrap_proxy_url=None,
+                                     bootstrap_trust_env=False):
     validate_candidate_limit(max_candidates)
     diagnostics = {
         "status": "failed",
@@ -573,7 +597,10 @@ def get_optimized_cloudflare_proxies(proxies, *, max_candidates=DEFAULT_MAX_CAND
             diagnostics["status"] = "no_reusable_template"
             return []
 
-        networks = fetch_cloudflare_ipv4_networks(cache_dir)
+        networks = fetch_cloudflare_ipv4_networks(
+            cache_dir, bootstrap_proxy_url=bootstrap_proxy_url,
+            bootstrap_trust_env=bootstrap_trust_env,
+        )
         # Apply the template budget only after validating official network membership.
         templates = get_cloudflare_templates(proxies, networks)
         diagnostics["template_count"] = len(templates)
@@ -585,6 +612,8 @@ def get_optimized_cloudflare_proxies(proxies, *, max_candidates=DEFAULT_MAX_CAND
         addresses = run_cloudflare_speedtest(
             networks, port=443, max_candidates=max_candidates,
             cache_dir=cache_dir, diagnostics_dir=diagnostics_dir,
+            bootstrap_proxy_url=bootstrap_proxy_url,
+            bootstrap_trust_env=bootstrap_trust_env,
         )
         diagnostics["speedtested_ingress_count"] = len(addresses)
         candidates = expand_cloudflare_proxies(

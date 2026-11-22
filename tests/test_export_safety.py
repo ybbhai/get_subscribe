@@ -1,6 +1,8 @@
 """Regression coverage for reserved names and failure-safe config replacement."""
 import copy
 import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -164,3 +166,10 @@ class AtomicExportTests(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), self.mirror.read_bytes())
         self.assertEqual(yaml.safe_load(self.output.read_text(encoding="utf-8"))["proxies"][0]["name"], "node")
         self.assert_no_temporaries()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file permission bits are required")
+    def test_generated_yaml_files_have_requested_permissions(self):
+        self.manager.save_config([node()], str(self.output))
+        for path in (self.output, self.mirror):
+            with self.subTest(path=path.name):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o777)

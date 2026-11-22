@@ -291,6 +291,52 @@ class MultiSourceCollectionTests(unittest.TestCase):
         self.assertEqual(diagnostics["sources"][-1]["id"], "cloudflare_auto")
         self.assertEqual(diagnostics["sources"][-1]["accepted_count"], 3)
 
+    def test_automatic_optimizer_runs_after_collection_proxy_stops(self):
+        self.rss.return_value = [worker("rss-template")]
+        stopped = {"value": False}
+        process = Mock()
+
+        def optimize(nodes, **kwargs):
+            self.assertTrue(stopped["value"])
+            self.assertIsNone(kwargs["bootstrap_proxy_url"])
+            self.assertTrue(kwargs["bootstrap_trust_env"])
+            return []
+
+        def stop(_process):
+            stopped["value"] = True
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("main.start_proxies", return_value=(process, 17500)), \
+                patch("main.stop_proxies", side_effect=stop), \
+                patch("main._detect_fallback_proxy", return_value=None), \
+                patch("main.get_optimized_cloudflare_proxies", side_effect=optimize), \
+                patch("main.test_proxies_async", new=AsyncMock(side_effect=lambda nodes, **kw: nodes)), \
+                patch("main.test_nodes", side_effect=lambda nodes, *args: nodes):
+            main("prod", directory, {"vpngate": {"enabled": False}})
+
+        self.assertTrue(stopped["value"])
+
+    def test_automatic_optimizer_reuses_detected_fallback_proxy(self):
+        self.rss.return_value = [worker("rss-template")]
+        proxy_url = "http://127.0.0.1:7890"
+        optimizer_calls = []
+
+        def optimize(nodes, **kwargs):
+            optimizer_calls.append(kwargs)
+            return []
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("main.start_proxies", return_value=(None, None)), \
+                patch("main._detect_fallback_proxy", return_value=proxy_url) as detect, \
+                patch("main.get_optimized_cloudflare_proxies", side_effect=optimize), \
+                patch("main.test_proxies_async", new=AsyncMock(side_effect=lambda nodes, **kw: nodes)), \
+                patch("main.test_nodes", side_effect=lambda nodes, *args: nodes):
+            main("prod", directory, {"vpngate": {"enabled": False}})
+
+        detect.assert_called_once_with()
+        self.assertEqual(optimizer_calls[0]["bootstrap_proxy_url"], proxy_url)
+        self.assertFalse(optimizer_calls[0]["bootstrap_trust_env"])
+
     def test_vpngate_failure_is_reported_and_existing_subscription_survives(self):
         self.gate.side_effect = requests.Timeout("https://private.example/token")
         self.rss.return_value = [worker("rss")]

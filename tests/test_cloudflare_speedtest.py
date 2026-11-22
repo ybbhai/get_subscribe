@@ -58,6 +58,27 @@ class CloudflareRangeTests(unittest.TestCase):
         self.assertEqual(networks, [ipaddress.ip_network("104.16.0.0/13")])
         response.close.assert_called_once_with()
 
+    def test_official_range_fetch_uses_explicit_bootstrap_proxy(self):
+        response = Mock()
+        response.iter_content.return_value = [b"104.16.0.0/13\n"]
+        session = Mock()
+        session.get.return_value = response
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("utils.cloudflare_speedtest.requests.Session", return_value=session):
+            networks = fetch_cloudflare_ipv4_networks(
+                directory, bootstrap_proxy_url="http://127.0.0.1:17500"
+            )
+
+        self.assertEqual(networks, [ipaddress.ip_network("104.16.0.0/13")])
+        self.assertEqual(session.proxies, {
+            "http": "http://127.0.0.1:17500",
+            "https": "http://127.0.0.1:17500",
+        })
+        self.assertFalse(session.trust_env)
+        self.assertEqual(session.get.call_args.args[0],
+                         "https://www.cloudflare.com/ips-v4")
+
     def test_samples_bounded_ipv4_subnets(self):
         networks = [
             ipaddress.ip_network("104.16.0.0/16"),
