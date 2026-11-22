@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 from html.parser import HTMLParser
+from itertools import zip_longest
 import ipaddress
 import logging
 import os
@@ -19,8 +20,22 @@ import yaml
 from urllib3.util.retry import Retry
 
 from utils.utils import test_nodes, v2ray_2_clash, SSLAdapter, clean_yaml_content, parse_special_clash, filter_proxies, \
-    test_proxies_async
-from utils.clash_manager import GENERATED_PROXY_CONFIG, read_listen_ports, find_free_port_block
+    test_proxies_async, requires_tcp_probe
+from utils.clash_manager import GENERATED_PROXY_CONFIG, read_listen_ports, find_free_port_block, _normalize_proxies
+from utils.mihomo_runtime import resolve_mihomo_executable, ensure_openvpn_runtime, MihomoRuntimeError
+from utils.cloudflare_config import DEFAULT_CLOUDFLARE_CONFIG, load_cloudflare_config, save_cloudflare_config
+from utils.cloudflare_source import (
+    DEFAULT_MAX_CANDIDATES,
+    CloudflareSourceError,
+    get_cloudflare_proxies,
+)
+from utils.cloudflare_speedtest import (
+    DEFAULT_MAX_CANDIDATES as DEFAULT_CF_SPEEDTEST_CANDIDATES,
+    get_optimized_cloudflare_proxies,
+)
+from utils.vpngate_source import DEFAULT_VPNGATE_URL, get_vpngate_proxies
+from utils.source_tracking import proxy_source_ids, stage_counts, tag_source
+from utils.proxy_chain import apply_runtime_defaults
 
 requests.packages.urllib3.disable_warnings()
 
@@ -517,6 +532,7 @@ def _write_bootstrap_config(source_path, output_path, mixed_port=None, controlle
     nodes = _filter_bootstrap_nodes(nodes)
     if not nodes:
         raise ValueError("上次生成的配置中没有可用的节点列表")
+    nodes = [apply_runtime_defaults(node) for node in nodes]
 
     group_name = "SUBSCRIPTION"
     names = [node["name"] for node in nodes]
@@ -705,7 +721,7 @@ def _probe_subscription_via_proxy(proxy_port, urls, timeout=None):
 
 
 def _check_bootstrap_proxy(proc, port, group_name, node_names,
-                           max_wait_seconds=None, controller_port=None):
+                           max_wait_seconds=None, controller_port=None, node_types=None):
     """切换节点，并用真实订阅源验证它能否代理抓取数据。
 
     判定依据必须是“这个节点真的抓到了订阅数据”：旧实现只请求
@@ -717,11 +733,14 @@ def _check_bootstrap_proxy(proc, port, group_name, node_names,
                  f"/proxies/{quote(group_name, safe='')}")
     probe_urls = _probe_targets()
     candidates = list(node_names)[:BOOTSTRAP_MAX_PROBE_NODES]
-    if not candidates:
+    if not candidates or not probe_urls:
         return False
+    node_types = node_types or {}
+    budgets = {name: 35 if str(node_types.get(name, "")).lower() == "openvpn"
+               else BOOTSTRAP_NODE_BUDGET_SECONDS for name in candidates}
     # 每个节点有独立的探测预算，整体超时按节点数放大（额外留出切换开销）
     if max_wait_seconds is None:
-        max_wait_seconds = BOOTSTRAP_NODE_BUDGET_SECONDS * len(candidates) + 10
+        max_wait_seconds = sum(budgets.values()) + 10
     deadline = time.monotonic() + max_wait_seconds
 
     with requests.Session() as api_session:
@@ -750,12 +769,28 @@ def _check_bootstrap_proxy(proc, port, group_name, node_names,
             if proc.poll() is not None or remaining <= 0:
                 return False
 
-            ok, detail = _probe_subscription_via_proxy(
-                port, probe_urls,
-                timeout=min(BOOTSTRAP_NODE_BUDGET_SECONDS, remaining))
-            if ok:
-                logger.info("采集节点 %s 可正常代理抓取订阅数据（%s）", node_name, detail)
-                return True
+            node_deadline = min(deadline, time.monotonic() + budgets[node_name])
+            retry_handshake = str(node_types.get(node_name, "")).lower() == "openvpn"
+            detail = "探测预算耗尽"
+            while proc.poll() is None:
+                remaining = node_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ok, detail = _probe_subscription_via_proxy(
+                    port, probe_urls,
+                    timeout=min(BOOTSTRAP_NODE_BUDGET_SECONDS, remaining))
+                if ok:
+                    logger.info("采集节点 %s 可正常代理抓取订阅数据（%s）", node_name, detail)
+                    return True
+                if not retry_handshake:
+                    break
+                # A short outer HTTP dial failure does not cancel Mihomo's
+                # independent OpenVPN handshake. Keep this same node selected
+                # and retry real subscription fetches inside its shared budget.
+                remaining = node_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.25, remaining))
             logger.warning("采集节点 %s 无法抓取订阅数据（%s），尝试下一个节点",
                            node_name, detail)
     return False
@@ -764,8 +799,11 @@ def _check_bootstrap_proxy(proc, port, group_name, node_names,
 def start_proxies():
     """优先用上次保存的节点启动采集代理，失败时回退到本地配置。"""
     path = os.path.join(os.path.dirname(__file__), "clash")
-    exe = "linux-compatible" if os.name != "nt" else "windows-compatible.exe"
-    exe_path = os.path.join(path, exe)
+    try:
+        exe_path = resolve_mihomo_executable()
+    except (OSError, ValueError) as error:
+        logger.error("无法选择 Mihomo 内核: %s，将直连拉取订阅", error)
+        return None, None
     if not os.path.isfile(exe_path):
         logger.error("Clash 可执行文件不存在: %s，将直连拉取订阅", exe_path)
         return None, None
@@ -801,8 +839,11 @@ def start_proxies():
                     with open(config_path, encoding="utf-8") as config_file:
                         runtime_config = yaml.safe_load(config_file)
                     node_names = runtime_config["proxy-groups"][0]["proxies"]
+                    node_types = {node["name"]: node.get("type", "")
+                                  for node in runtime_config.get("proxies", [])}
                     if _check_bootstrap_proxy(proc, port, group_name, node_names,
-                                              controller_port=actual_controller):
+                                              controller_port=actual_controller,
+                                              node_types=node_types):
                         logger.info("采集代理已通过出站检查，HTTP 端口 %s", port)
                         return proc, port
                     logger.warning("配置 %s 中没有可用采集节点，停止并继续检查其他配置；详情见 %s",
@@ -824,24 +865,165 @@ def stop_proxies(proc):
             proc.wait()
 
 
-def _collect_proxies(proxies, use_local_proxy, proxy_port):
-    """把 RSS 与 Clash 两类订阅源的结果追加到 proxies。
+def _collect_proxies(proxies, use_local_proxy, proxy_port, cloudflare_source=None,
+                     *, profile="dev", diagnostics=None):
+    """把 RSS、Clash 和可选 Cloudflare 来源追加到统一候选列表。
 
     单个源抛异常不能中断整轮采集，否则另一类源已经拿到的节点会全部丢失。
     """
-    try:
-        proxies.extend(get_subscribe_proxies(use_local_proxy=use_local_proxy,
-                                             proxy_port=proxy_port) or [])
-    except Exception as e:
-        logger.error("获取 RSS 订阅节点时发生未预期异常: %s", e, exc_info=True)
-    try:
-        proxies.extend(get_clash_proxies(use_local_proxy=use_local_proxy,
-                                         proxy_port=proxy_port))
-    except Exception as e:
-        logger.error("获取 Clash 订阅节点时发生未预期异常: %s", e, exc_info=True)
+    diagnostics = diagnostics if diagnostics is not None else {}
+    summaries = diagnostics.setdefault("sources", [])
+    for source_id, collector in (("rss", get_subscribe_proxies),
+                                 ("clash_subscriptions", get_clash_proxies)):
+        summary = {"id": source_id, "type": "subscription", "parsed_count": 0}
+        summaries.append(summary)
+        try:
+            raw_nodes = collector(use_local_proxy=use_local_proxy, proxy_port=proxy_port) or []
+            # Upstream private fields are not local measurements or provenance.
+            nodes = [{key: value for key, value in node.items()
+                      if isinstance(key, str) and not key.startswith("_")}
+                     for node in raw_nodes if isinstance(node, dict)]
+            summary["rejected_count"] = len(raw_nodes) - len(nodes)
+            proxies.extend(tag_source(node, source_id, "subscription") for node in nodes)
+            summary.update(status="ok" if nodes else "empty", parsed_count=len(raw_nodes),
+                           accepted_count=len(nodes))
+        except Exception as error:
+            summary.update(status="failed", reason=type(error).__name__, accepted_count=0)
+            logger.warning("来源 %s 采集失败（%s）", source_id, type(error).__name__)
+
+    config = cloudflare_source or {}
+    sources = list(config.get("sources", []))
+    if config.get("subscription_url") or config.get("subscription_file"):
+        sources.insert(0, {**config, "id": "cloudflare_legacy", "enabled": True})
+    gate = config.get("vpngate", {})
+    sources.append({**gate, "id": "vpngate", "enabled": gate.get("enabled", profile == "prod")})
+    pools = []
+    for source in sources:
+        source_id = source["id"]
+        category = "vpngate" if source_id == "vpngate" else "cloudflare_subscription"
+        summary = {"id": source_id, "type": category, "parsed_count": 0,
+                   "accepted_count": 0}
+        summaries.append(summary)
+        if not source.get("enabled", True):
+            summary["status"] = "disabled"
+            continue
+        session = None
+        try:
+            session = _subscription_session(use_local_proxy, proxy_port)
+            if source_id == "vpngate":
+                detail = {}
+                nodes = get_vpngate_proxies(
+                    session, api_url=source.get("api_url", DEFAULT_VPNGATE_URL),
+                    mirror_urls=source.get("mirror_urls", ()),
+                    max_candidates=source.get("max_candidates", 100),
+                    timeout=SUBSCRIPTION_TIMEOUT, diagnostics=detail,
+                )
+                summary["collection"] = detail
+            else:
+                nodes = get_cloudflare_proxies(
+                    session, subscription_url=source.get("subscription_url"),
+                    subscription_file=source.get("subscription_file"),
+                    addresses_file=source.get("addresses_file"),
+                    addresses_format=source.get("addresses_format", "addresses"),
+                    template_index=source.get("template_index", 1),
+                    max_candidates=source.get("max_candidates", 100),
+                    timeout=SUBSCRIPTION_TIMEOUT,
+                )
+            tagged = _normalize_proxies([tag_source(node, source_id, category) for node in nodes])
+            pools.append(tagged)
+            summary.update(status="ok" if nodes else "empty", parsed_count=len(nodes),
+                           unique_candidate_count=len(tagged), duplicate_count=len(nodes) - len(tagged))
+            if source_id == "vpngate" and not nodes and detail.get("status") == "unavailable":
+                summary.update(status="failed", reason=detail.get("error_type", "source_unavailable"))
+            logger.info("来源 %s 取得 %d 个候选路径", source_id, len(tagged))
+        except Exception as error:
+            summary.update(status="failed", reason=type(error).__name__)
+            logger.warning("来源 %s 采集失败（%s）", source_id, type(error).__name__)
+        finally:
+            if session is not None:
+                session.close()
+
+    # Round robin before dedup preserves source coverage; merge all provenance
+    # before truncating so mirrors cannot consume separate candidate slots.
+    interleaved = [node for row in zip_longest(*pools) for node in row if node is not None]
+    unique = _normalize_proxies(interleaved)
+    accepted = unique[:config.get("max_total_candidates", 500)]
+    counts = stage_counts(accepted)["by_source"]
+    for summary in summaries:
+        if summary["type"] != "subscription":
+            summary["accepted_count"] = counts.get(summary["id"], 0)
+            summary["budget_dropped_count"] = max(
+                0, summary.get("unique_candidate_count", 0) - summary["accepted_count"])
+    diagnostics["additional_sources"] = {
+        "parsed_count": sum(summary["parsed_count"] for summary in summaries
+                            if summary["type"] != "subscription"),
+        "unique_candidate_count": len(unique),
+        "accepted_count": len(accepted), "limit": config.get("max_total_candidates", 500),
+    }
+    proxies.extend(accepted)
 
 
-def main(env, dirs):
+def _merge_cloudflare_source(saved_source, cli_source):
+    if cli_source is None:
+        return saved_source
+
+    source = dict(saved_source or {})
+    if "vpngate" in cli_source:
+        source["vpngate"] = {**source.get("vpngate", {}), **cli_source["vpngate"]}
+    if cli_source.get("subscription_file") is not None:
+        source["subscription_file"] = cli_source["subscription_file"]
+        source["subscription_url"] = None
+    elif cli_source.get("subscription_url") is not None:
+        source["subscription_url"] = cli_source["subscription_url"]
+        source["subscription_file"] = None
+
+    for key in (
+            "addresses_file", "addresses_format", "template_index", "max_candidates", "automatic_enabled"):
+        if cli_source.get(key) is not None:
+            source[key] = cli_source[key]
+    if cli_source.get("max_candidates") is not None:
+        source["automatic_max_candidates"] = cli_source["max_candidates"]
+
+    if not (source.get("subscription_file") or source.get("subscription_url")):
+        manual_source_keys = ("addresses_file", "addresses_format", "template_index")
+        if any(cli_source.get(key) is not None for key in manual_source_keys):
+            raise ValueError("Cloudflare 地址文件和模板序号需要订阅文件/URL")
+        source.setdefault("max_candidates", DEFAULT_CF_SPEEDTEST_CANDIDATES)
+        return source
+
+    source.setdefault("addresses_file", None)
+    source.setdefault("addresses_format", "addresses")
+    source.setdefault("template_index", 1)
+    source.setdefault("max_candidates", DEFAULT_MAX_CANDIDATES)
+    return source
+
+
+def _append_optimized_cloudflare_proxies(proxies, max_candidates, diagnostics_dir=None):
+    """Add locally discovered Cloudflare candidates without blocking other sources."""
+    try:
+        cloudflare_proxies = get_optimized_cloudflare_proxies(
+            proxies, max_candidates=max_candidates, diagnostics_dir=diagnostics_dir
+        )
+    except CloudflareSourceError as error:
+        logger.warning("自动 Cloudflare 优选不可用，将继续使用抓取节点: %s", error)
+        return {"id": "cloudflare_auto", "type": "cloudflare_auto", "status": "failed",
+                "reason": type(error).__name__, "parsed_count": 0, "accepted_count": 0}
+    except Exception as error:
+        logger.warning(
+            "自动 Cloudflare 优选处理失败，将继续使用抓取节点（%s）",
+            type(error).__name__,
+        )
+        return {"id": "cloudflare_auto", "type": "cloudflare_auto", "status": "failed",
+                "reason": type(error).__name__, "parsed_count": 0, "accepted_count": 0}
+
+    proxies.extend(cloudflare_proxies)
+    logger.info("自动 Cloudflare 优选生成 %d 个候选节点", len(cloudflare_proxies))
+    return {"id": "cloudflare_auto", "type": "cloudflare_auto",
+            "status": "ok" if cloudflare_proxies else "empty",
+            "parsed_count": len(cloudflare_proxies), "accepted_count": len(cloudflare_proxies)}
+
+
+def main(env, dirs, cloudflare_source=None):
     # 每轮重新探测出口代理：常驻模式下用户可能中途才启动代理客户端，
     # 若沿用上一轮的负缓存（空字符串）就会永远走直连，再也抓不到被墙的源站。
     global _FALLBACK_PROXY_CACHE
@@ -852,10 +1034,12 @@ def main(env, dirs):
         logger.warning("没有通过检查的 Clash 采集节点，本轮尝试直连订阅源")
 
     proxies = []
+    diagnostics = {"sources": [], "stage_counts": {}}
     try:
         route = f"本地 Clash 127.0.0.1:{proxy_port or MAIN_MIXED_PORT}" if proc else "直连"
         logger.info("本轮 RSS 与 Clash 订阅请求使用 %s", route)
-        _collect_proxies(proxies, proc is not None, proxy_port)
+        _collect_proxies(proxies, proc is not None, proxy_port, cloudflare_source,
+                         profile=env, diagnostics=diagnostics)
 
         # 本地代理这一轮一个节点都没抓到（节点在中途失效/被限速），
         # 不能就此判定本轮失败：退到直连再试一次，否则整轮产出为 0。
@@ -864,10 +1048,38 @@ def main(env, dirs):
             stop_proxies(proc)
             proc = None
             _FALLBACK_PROXY_CACHE = None
-            _collect_proxies(proxies, False, None)
+            diagnostics["collection_retry"] = "direct"
+            diagnostics["sources"] = []
+            _collect_proxies(proxies, False, None, cloudflare_source,
+                             profile=env, diagnostics=diagnostics)
+        if any(isinstance(node, dict) and node.get("type") == "openvpn" for node in proxies):
+            runtime_session = None
+            try:
+                runtime_session = _subscription_session(proc is not None, proxy_port)
+                ensure_openvpn_runtime(session=runtime_session)
+                diagnostics["openvpn_runtime"] = {"status": "ready"}
+            except Exception as error:
+                diagnostics["openvpn_runtime"] = {"status": "unavailable", "reason": type(error).__name__}
+                if isinstance(error, MihomoRuntimeError):
+                    diagnostics["openvpn_runtime"]["detail"] = str(error)
+                logger.warning("OpenVPN 内核准备失败（%s）；检测阶段会记录不支持的候选", type(error).__name__)
+            finally:
+                if runtime_session is not None:
+                    runtime_session.close()
     finally:
         stop_proxies(proc)
+
+    max_candidates = (cloudflare_source or {}).get(
+        "automatic_max_candidates", DEFAULT_CF_SPEEDTEST_CANDIDATES
+    )
+    if (cloudflare_source or {}).get("automatic_enabled", True):
+        diagnostics["sources"].append(_append_optimized_cloudflare_proxies(proxies, max_candidates, dirs))
+    else:
+        diagnostics["sources"].append({"id": "cloudflare_auto", "type": "cloudflare_auto",
+                                       "status": "disabled", "parsed_count": 0, "accepted_count": 0})
+    diagnostics["stage_counts"]["collected"] = stage_counts(proxies)
     proxies = filter_proxies(proxies)
+    diagnostics["stage_counts"]["normalized"] = stage_counts(proxies)
 
     logger.info("去重后共 %d 个节点", len(proxies))
 
@@ -878,13 +1090,22 @@ def main(env, dirs):
     elif len(proxies) > 500:
         timeout = 4
 
-    logger.info("开始异步 TCP 测试，共 %d 个节点...", len(proxies))
+    tcp_candidates = [node for node in proxies if requires_tcp_probe(node)]
+    tcp_skipped = [node for node in proxies if not requires_tcp_probe(node)]
+    logger.info("TCP 快筛：测试 %d 条，%d 条需直接进行协议/服务验证", len(tcp_candidates), len(tcp_skipped))
     available_proxies = asyncio.run(test_proxies_async(proxies, timeout=timeout))
-    logger.info("TCP 测试通过: %d/%d 个节点", len(available_proxies), len(proxies))
+    tcp_passed = [node for node in available_proxies if requires_tcp_probe(node)]
+    diagnostics["stage_counts"]["tcp_tested"] = stage_counts(tcp_candidates)
+    diagnostics["stage_counts"]["tcp_skipped"] = stage_counts(tcp_skipped)
+    diagnostics["stage_counts"]["tcp_passed"] = stage_counts(tcp_passed)
+    diagnostics["stage_counts"]["tcp_retained"] = stage_counts(available_proxies)
+    logger.info("TCP 实测通过 %d/%d，连同跳过快筛的节点共保留 %d 条",
+                len(tcp_passed), len(tcp_candidates), len(available_proxies))
 
     # 测试 proxies 的可用性
-    if available_proxies:
-        available_proxies = test_nodes(available_proxies, env, dirs, timeout)
+    # Also refresh an empty-round report so an old successful report is not
+    # mistaken for the current run. Existing output remains on total failure.
+    available_proxies = test_nodes(available_proxies, env, dirs, timeout, diagnostics)
     logger.info("可用节点总数: %d", len(available_proxies))
     # 回传结果，便于入口/调用方判断本次是否真的产出了配置
     return available_proxies
@@ -930,24 +1151,99 @@ def parse_command_args():
         help='只执行一次后退出（CI / 外部 cron 场景），默认是定时循环执行'
     )
 
+    cloudflare_subscription = parser.add_mutually_exclusive_group()
+    cloudflare_subscription.add_argument(
+        '--cloudflare-subscription-file',
+        help='EdgeTunnel URI 或 Clash YAML 订阅文件（支持 CFnew OpenVPN 家宽链式订阅）'
+    )
+    cloudflare_subscription.add_argument(
+        '--cloudflare-subscription-url',
+        help='自己的 EdgeTunnel HTTPS 订阅地址（可能含令牌，优先使用文件参数）'
+    )
+    parser.add_argument(
+        '--cloudflare-addresses-file',
+        help='可选：Cloudflare 地址列表或 CloudflareSpeedTest CSV'
+    )
+    parser.add_argument(
+        '--cloudflare-addresses-format',
+        choices=('addresses', 'cloudflare-speedtest-csv'),
+        help='Cloudflare 地址文件格式'
+    )
+    parser.add_argument(
+        '--cloudflare-template-index',
+        type=int,
+        help='使用订阅中第几个 VLESS/WS/TLS 节点作为地址模板（从 1 开始）'
+    )
+    parser.add_argument(
+        '--cloudflare-max-candidates',
+        type=int,
+        help='自动 Cloudflare 优选最多加入的候选数量'
+    )
+    parser.add_argument(
+        '--no-cloudflare-optimize',
+        dest='cloudflare_automatic_enabled', action='store_false', default=None,
+        help='跳过自动入口 IP 测速，仍导入配置的 Worker/CFnew 订阅'
+    )
+    vpngate_group = parser.add_mutually_exclusive_group()
+    vpngate_group.add_argument('--vpngate', dest='vpngate_enabled', action='store_true', default=None,
+                              help='启用 VPN Gate 官方 OpenVPN 来源（prod 默认启用）')
+    vpngate_group.add_argument('--no-vpngate', dest='vpngate_enabled', action='store_false',
+                              help='关闭 VPN Gate 来源，仍采集其他订阅')
+    parser.add_argument(
+        '--cloudflare-config',
+        default=str(DEFAULT_CLOUDFLARE_CONFIG),
+        help='Cloudflare 持久配置文件路径'
+    )
+    parser.add_argument(
+        '--configure-cloudflare',
+        action='store_true',
+        help='保存 Cloudflare 参数后退出，后续运行自动读取'
+    )
+
     # 3. 解析参数（自动处理参数顺序，忽略顺序差异）
     args = parser.parse_args()
+    if (args.cloudflare_template_index is not None
+            and args.cloudflare_template_index < 1):
+        parser.error('--cloudflare-template-index 必须大于等于 1')
+    if (args.cloudflare_max_candidates is not None
+            and not 1 <= args.cloudflare_max_candidates <= 500):
+        parser.error('--cloudflare-max-candidates 必须在 1–500 之间')
+    if args.configure_cloudflare and not (
+            args.cloudflare_subscription_file or args.cloudflare_subscription_url):
+        parser.error('--configure-cloudflare 需要同时指定 Cloudflare 订阅文件或 URL')
 
     # 4. 转换为字典（方便使用）
+    cloudflare_source = {
+        key: value for key, value in {
+            'subscription_file': args.cloudflare_subscription_file,
+            'subscription_url': args.cloudflare_subscription_url,
+            'addresses_file': args.cloudflare_addresses_file,
+            'addresses_format': args.cloudflare_addresses_format,
+            'template_index': args.cloudflare_template_index,
+            'max_candidates': args.cloudflare_max_candidates,
+            'automatic_enabled': args.cloudflare_automatic_enabled,
+        }.items() if value is not None
+    }
+    if args.vpngate_enabled is not None:
+        cloudflare_source['vpngate'] = {'enabled': args.vpngate_enabled}
+
     return {
         'profile': args.profile,
         'directory': args.directory,
         'interval': args.interval,
         'once': args.once,
+        'configure_cloudflare': args.configure_cloudflare,
+        'cloudflare_config': args.cloudflare_config,
+        'cloudflare_source': cloudflare_source or None,
     }
 
 
-def run_round(env, dirs):
+def run_round(env, dirs, cloudflare_source=None):
     """执行一轮完整的订阅采集与测速，返回可用节点列表。
 
     异常向上抛出，由调用方决定是直接退出（--once）还是继续下一轮（循环模式）。
     """
-    results = main(env, dirs)
+    results = main(env, dirs, cloudflare_source)
     if results:
         logger.info("本次更新完成，可用节点 %d 个，环境 %s，输出目录 %s",
                     len(results), env, dirs)
@@ -977,7 +1273,7 @@ def wait_next_round(seconds, stop_event):
     return stop_event.wait(seconds)
 
 
-def run_forever(env, dirs, interval_hours):
+def run_forever(env, dirs, interval_hours, cloudflare_source=None):
     """定时循环执行：启动后立即跑一轮，之后每 interval_hours 小时重复一次。"""
     interval_seconds = interval_hours * 3600
     stop_event = threading.Event()
@@ -987,7 +1283,7 @@ def run_forever(env, dirs, interval_hours):
         round_no += 1
         logger.info("第 %d 轮订阅更新开始（间隔 %.1f 小时）", round_no, interval_hours)
         try:
-            run_round(env, dirs)
+            run_round(env, dirs, cloudflare_source)
         except Exception:
             # 单轮失败不能让常驻进程退出，否则定时更新就断了
             logger.exception("第 %d 轮订阅更新异常，继续下一轮", round_no)
@@ -1007,6 +1303,24 @@ if __name__ == '__main__':
     # 解析命令行参数
     args = parse_command_args()
 
+    if args.get('configure_cloudflare'):
+        try:
+            config_path = save_cloudflare_config(
+                args['cloudflare_source'], args['cloudflare_config'])
+        except (OSError, ValueError) as error:
+            logger.error("保存 Cloudflare 配置失败: %s", error)
+            raise SystemExit(1)
+        logger.info("Cloudflare 配置已保存到 %s", config_path)
+        raise SystemExit(0)
+
+    try:
+        saved_cloudflare_source = load_cloudflare_config(args['cloudflare_config'])
+        cloudflare_source = _merge_cloudflare_source(
+            saved_cloudflare_source, args.get('cloudflare_source'))
+    except ValueError as error:
+        logger.error("读取 Cloudflare 配置失败: %s", error)
+        raise SystemExit(1)
+
     env = "dev"
     if "profile" in args and args["profile"]:
         env = args["profile"]
@@ -1023,7 +1337,7 @@ if __name__ == '__main__':
     if args.get("once"):
         # 单次执行：供 GitHub Actions / 系统 cron 等外部调度器调用
         try:
-            results = run_round(env, dirs)
+            results = run_round(env, dirs, cloudflare_source)
         except Exception:
             logger.exception("订阅更新流程异常中止")
             raise SystemExit(1)
@@ -1031,4 +1345,4 @@ if __name__ == '__main__':
             raise SystemExit(2)
     else:
         # 默认行为：常驻定时循环执行
-        run_forever(env, dirs, interval_hours)
+        run_forever(env, dirs, interval_hours, cloudflare_source)

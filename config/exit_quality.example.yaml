@@ -1,0 +1,6 @@
+# 复制为 config/exit_quality.yaml 后填入自己的 ipapi.is API key。
+# 该本地文件已忽略提交；请勿将真实 key 写入本示例文件。
+# prod 自动启用家宽识别；未配置 key 时家宽属性仍为未知。
+# IPAPI_IS_KEY 环境变量优先于此文件。
+# 也可用 EXIT_QUALITY_CONFIG 指定其他配置文件路径。
+ipapi_is_key: ""

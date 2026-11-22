@@ -1,0 +1,16 @@
+# 复制为同目录 node_policy.yaml 即生效；以下为 prod 环境默认值。
+# “纯净”是低风险信号判定，不是绝对信誉保证。
+max_risk_score: 10
+# ipapi.is company/asn abuser_score 的上限，范围 0–1。
+max_abuse_score: 0.01
+# 所有层级均须达到性能门槛，不能用低风险标签替代性能合格。
+# 速度单位为 kbit/s，必须完成下载测速；延时是 gstatic generate_204 响应时长。
+# dev 未配置时速度下限为 0、延时上限为 60000ms；显式配置对所有环境生效。
+min_speed_kbps: 5000
+max_latency_ms: 1500
+# 只有通过低风险检测、具有 ISP 类型证据且达到以下实测门槛才排第一层。
+residential_min_speed_kbps: 5000
+residential_max_latency_ms: 1000
+lookup_timeout_seconds: 8
+# prod 先复测再查出口；复测失败从后续候选补位，出口查询总数不超过此预算。
+max_lookups_per_round: 200

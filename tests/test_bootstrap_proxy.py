@@ -9,16 +9,123 @@ import requests
 from main import (
     BOOTSTRAP_MAX_PROBE_NODES,
     BOOTSTRAP_NODE_BUDGET_SECONDS,
+    GENERATED_PROXY_CONFIG,
     acquire_instance_lock,
     _check_bootstrap_proxy,
     _filter_bootstrap_nodes,
     _probe_subscription_via_proxy,
     _write_bootstrap_config,
     main,
+    start_proxies,
 )
 
 
 class BootstrapProxyTests(unittest.TestCase):
+    def _openvpn_bootstrap(self, probe_outcome, *, max_wait_seconds=None, node_type="openvpn"):
+        clock = {"now": 100.0, "sleeps": [], "timeouts": []}
+        process = Mock()
+        process.poll.return_value = None
+        api_session = MagicMock()
+        api_session.__enter__.return_value = api_session
+        api_session.get.return_value.json.return_value = {"now": "vpn"}
+
+        def probe(port, urls, timeout):
+            self.assertEqual(port, 17000)
+            self.assertEqual(urls, ["https://rss.example"])
+            clock["timeouts"].append(timeout)
+            return probe_outcome(clock, timeout)
+
+        def sleep(seconds):
+            clock["sleeps"].append(seconds)
+            clock["now"] += seconds
+
+        with patch("main.requests.Session", return_value=api_session), \
+                patch("main._probe_targets", return_value=["https://rss.example"]), \
+                patch("main.time.monotonic", side_effect=lambda: clock["now"]), \
+                patch("main.time.sleep", side_effect=sleep), \
+                patch("main._probe_subscription_via_proxy", side_effect=probe):
+            ready = _check_bootstrap_proxy(process, 17000, "SUBSCRIPTION", ["vpn"],
+                                           max_wait_seconds=max_wait_seconds,
+                                           node_types={"vpn": node_type})
+        return ready, clock, api_session
+
+    def test_openvpn_bootstrap_retries_same_node_until_handshake_is_ready(self):
+        def probe(clock, timeout):
+            clock["now"] += min(5, timeout)
+            return clock["now"] >= 130, "subscription verdict"
+
+        ready, clock, api = self._openvpn_bootstrap(probe)
+
+        self.assertTrue(ready)
+        self.assertGreater(clock["now"], 124)
+        self.assertLessEqual(clock["now"], 135)
+        self.assertEqual(len(clock["timeouts"]), 6)
+        self.assertEqual(api.put.call_count, 1)
+        self.assertEqual(api.put.call_args.kwargs["json"], {"name": "vpn"})
+        self.assertTrue(all(0 < timeout <= 24 for timeout in clock["timeouts"]))
+
+    def test_openvpn_bootstrap_stops_at_shared_budget(self):
+        def probe(clock, timeout):
+            clock["now"] += min(5, timeout)
+            return False, "dial failed"
+
+        ready, clock, api = self._openvpn_bootstrap(probe)
+
+        self.assertFalse(ready)
+        self.assertEqual(clock["now"], 135)
+        self.assertEqual(len(clock["timeouts"]), 7)
+        self.assertEqual(clock["timeouts"][-1], 3.5)
+        self.assertEqual(api.put.call_count, 1)
+
+    def test_openvpn_bootstrap_global_deadline_caps_node_budget(self):
+        def probe(clock, timeout):
+            clock["now"] += min(5, timeout)
+            return False, "dial failed"
+
+        ready, clock, _ = self._openvpn_bootstrap(probe, max_wait_seconds=10)
+
+        self.assertFalse(ready)
+        self.assertEqual(clock["now"], 110)
+        self.assertEqual(clock["timeouts"], [10, 4.75])
+
+    def test_openvpn_bootstrap_immediate_errors_back_off(self):
+        ready, clock, _ = self._openvpn_bootstrap(lambda clock, timeout: (False, "HTTP 502"))
+
+        self.assertFalse(ready)
+        self.assertEqual(clock["now"], 135)
+        self.assertEqual(len(clock["timeouts"]), 140)
+        self.assertTrue(all(0 < delay <= 0.25 for delay in clock["sleeps"]))
+
+    def test_ordinary_bootstrap_keeps_one_probe_without_retry(self):
+        ready, clock, _ = self._openvpn_bootstrap(lambda clock, timeout: (False, "HTTP 502"),
+                                                 node_type="vless")
+        self.assertFalse(ready)
+        self.assertEqual(clock["timeouts"], [BOOTSTRAP_NODE_BUDGET_SECONDS])
+        self.assertEqual(clock["sleeps"], [])
+
+    def test_start_proxies_passes_types_from_prepared_runtime_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clash_dir = os.path.join(directory, "clash")
+            os.mkdir(clash_dir)
+            executable = os.path.join(clash_dir, "test-core")
+            with open(executable, "w", encoding="utf-8") as stream:
+                stream.write("unused mocked core")
+            with open(os.path.join(clash_dir, GENERATED_PROXY_CONFIG), "w", encoding="utf-8") as stream:
+                yaml.safe_dump({"proxies": [
+                    {"name": "vpn", "type": "openvpn", "server": "vpn.example", "port": 1194},
+                    {"name": "edge", "type": "vless", "server": "edge.example", "port": 443},
+                ]}, stream)
+            process = Mock()
+            with patch("main.__file__", os.path.join(directory, "main.py")), \
+                    patch("main.resolve_mihomo_executable", return_value=executable), \
+                    patch("main.find_free_port_block", side_effect=[(17000, 17000), (17700, 17700)]), \
+                    patch("main._launch_clash", return_value=(process, 17000, 17700)), \
+                    patch("main._check_bootstrap_proxy", return_value=True) as check:
+                result = start_proxies()
+
+        self.assertEqual(result, (process, 17000))
+        self.assertEqual(check.call_args.kwargs["node_types"], {"vpn": "openvpn", "edge": "vless"})
+
     def test_instance_lock_rejects_second_holder_and_releases_on_close(self):
         with tempfile.TemporaryDirectory() as directory:
             lock_path = os.path.join(directory, "main.lock")

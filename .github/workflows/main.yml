@@ -41,6 +41,7 @@ jobs:
       env:
         # 裸跑 python main.py 会落到 dev 环境而不导出配置，必须显式指定 prod 与输出目录
         PYTHONUNBUFFERED: '1'
+        IPAPI_IS_KEY: ${{ secrets.IPAPI_IS_KEY }}
       run: |
         python main.py -p prod -d ./subscribe --once
 

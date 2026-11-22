@@ -8,7 +8,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import yaml
 
 from utils.clash_manager import ClashMetaManager
-from utils.utils import _test_node_metrics_async, sort_proxies_by_performance, test_link_async, test_nodes, test_proxy_telnet_async
+from utils.utils import (
+    _test_node_metrics_async,
+    sort_proxies_by_performance,
+    test_link_async,
+    test_links_concurrent,
+    test_nodes,
+    test_proxy_telnet_async,
+)
 
 
 class SelectionTests(unittest.TestCase):
@@ -128,6 +135,33 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(metrics["youtube_latency"], 200)
         self.assertEqual(metrics["avg_speed_kbps"], 4194.3)
         self.assertTrue(metrics["is_available"])
+
+    def test_node_probe_ignores_environment_proxy_and_uses_tested_node(self):
+        async def chunks(chunk_size):
+            yield b"ok"
+
+        response = SimpleNamespace(
+            status=200,
+            url=SimpleNamespace(host="example.com"),
+            content=SimpleNamespace(iter_chunked=chunks),
+        )
+        request_context = AsyncMock()
+        request_context.__aenter__.return_value = response
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.get.return_value = request_context
+        selected_node_proxy = "http://127.0.0.1:17500"
+
+        with patch("utils.utils.aiohttp.ClientSession", return_value=session) as create_session, \
+                patch("utils.utils.aiohttp.TCPConnector"):
+            results = asyncio.run(test_links_concurrent(
+                ["https://example.com"], proxies={"http": selected_node_proxy}
+            ))
+
+        self.assertFalse(create_session.call_args.kwargs["trust_env"])
+        self.assertEqual(session.get.call_args.kwargs["proxy"], selected_node_proxy)
+        self.assertTrue(results[0][1])
 
     def test_limit_preserves_only_global_and_service_candidates(self):
         for categories in ({"google", "youtube", "chatgpt"}, {"youtube"}, {"chatgpt"}):

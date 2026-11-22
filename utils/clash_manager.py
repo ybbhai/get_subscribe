@@ -2,16 +2,37 @@ import logging
 import json
 import os
 import socket
+import re
 import yaml
 import subprocess
 import time
 import requests
+import tempfile
+from functools import lru_cache
+from graphlib import CycleError, TopologicalSorter
+
+from utils.proxy_chain import BUILTIN_PROXY_NAMES, materialize_proxies
+from utils.node_policy import load_node_policy, preferred_pool, proxy_source_ids, select_candidates, SERVICES
+from utils.mihomo_runtime import MIN_OPENVPN_VERSION, resolve_mihomo_executable
+from utils.source_tracking import source_proxy_name
 
 BIN_PATH = os.path.join(os.path.dirname(__file__), "../clash")
 logger = logging.getLogger(__name__)
 
 # 上次生成的完整配置副本，落在 clash/ 下供下一次采集时启动本地代理使用
 GENERATED_PROXY_CONFIG = "proxy_generated.yaml"
+
+
+def supports_openvpn():
+    """Check only when OpenVPN was requested; older bundled cores must not break a batch."""
+    try:
+        executable = resolve_mihomo_executable()
+        result = subprocess.run([executable, "-v"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=5, check=False)
+        match = re.search(r"\bv(\d+)\.(\d+)\.(\d+)\b", result.stdout)
+        return result.returncode == 0 and match is not None and tuple(map(int, match.groups())) >= MIN_OPENVPN_VERSION
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
 
 
 def _is_port_free(port):
@@ -32,7 +53,9 @@ def find_free_port_block(size=2, start=17000, stop=17700, step=10):
     Clash 会直接绑定失败，整批节点测试就全部作废。调用方若需要并行起多个实例，
     请传入互不重叠的 [start, stop) 窗口，避免两个 worker 抢到同一段端口。
     """
-    for base in range(start, stop, step):
+    if size < 1 or step < 1 or not 1 <= start < stop <= 65536:
+        raise ValueError("invalid port allocation window")
+    for base in range(start, stop - size + 1, step):
         ports = range(base, base + size)
         if all(_is_port_free(port) for port in ports):
             return base, base + size - 1
@@ -82,51 +105,113 @@ def read_listen_ports(config_path, default_controller=9090, default_mixed=7890):
     return controller_port, mixed_port
 
 
-def _normalize_proxies(proxies):
+@lru_cache(maxsize=32)
+def _template_group_names(path, modified, size):
+    with open(path, "r", encoding="utf-8") as source:
+        config = yaml.safe_load(source) or {}
+    return frozenset(group["name"] for group in config.get("proxy-groups", []))
+
+
+def _reserved_proxy_names(*templates):
+    names = set(BUILTIN_PROXY_NAMES) | {"GLOBAL", "TEST"}
+    for path in dict.fromkeys((os.path.join(BIN_PATH, "base_template.yaml"),
+                               os.path.join(BIN_PATH, "test_template.yaml"), *templates)):
+        stat = os.stat(path)
+        names.update(_template_group_names(path, stat.st_mtime_ns, stat.st_size))
+    return names
+
+
+def _validate_proxy_graph(config):
+    """Reject ambiguous names, dangling references and cycles before replacing files."""
+    nodes = config.get("proxies", [])
+    groups = config.get("proxy-groups", [])
+    names = [item["name"] for item in nodes + groups]
+    if (len(names) != len(set(names)) or set(names) & BUILTIN_PROXY_NAMES
+            or any(node["name"] == "GLOBAL" for node in nodes)):
+        raise ValueError("proxy names collide with groups or built-in names")
+    graph = {node["name"]: [node["dialer-proxy"]] if node.get("dialer-proxy") else []
+             for node in nodes}
+    graph.update({group["name"]: group.get("proxies", []) for group in groups})
+    known = set(names) | BUILTIN_PROXY_NAMES
+    if any(reference not in known for refs in graph.values() for reference in refs):
+        raise ValueError("proxy configuration contains a missing reference")
+    try:
+        tuple(TopologicalSorter(graph).static_order())
+    except CycleError:
+        raise ValueError("proxy configuration contains a reference cycle") from None
+
+
+def _atomic_write_config(config, target_path):
+    _validate_proxy_graph(config)
+    directory = os.path.dirname(os.path.abspath(target_path))
+    os.makedirs(directory, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         dir=directory, prefix=".clash-", suffix=".yaml",
+                                         delete=False) as output:
+            temporary = output.name
+            yaml.safe_dump(config, output, allow_unicode=True)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, target_path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _normalize_proxies(proxies, reserved_names=None):
     normalized = []
-    seen_nodes = set()
-    used_names = set()
+    seen_nodes = {}
+    used_names = _reserved_proxy_names() | set(reserved_names or ())
     name_counts = {}
     for proxy in proxies or []:
         proxy_copy = dict(proxy)
         identity_data = {
             key: value for key, value in proxy_copy.items()
-            if key != "name"
+            if key not in {"name", "_source", "_source_ids", "_cloudflare_candidate_id"}
         }
         # 对 _categories 等集合类型进行排序，确保序列化结果一致
         if isinstance(identity_data.get('_categories'), set):
             identity_data['_categories'] = sorted(identity_data['_categories'])
         identity = json.dumps(identity_data, sort_keys=True, ensure_ascii=False, default=str)
         if identity in seen_nodes:
+            # 来源只用于诊断；合并重复传输配置时保留自动 CF 标记及其候选 ID。
+            retained = seen_nodes[identity]
+            retained["_source_ids"] = sorted(set(proxy_source_ids(retained)) | set(proxy_source_ids(proxy_copy)))
+            if proxy_copy.get("_source") == "cloudflare_auto":
+                retained["_source"] = "cloudflare_auto"
+                if "_cloudflare_candidate_id" in proxy_copy:
+                    retained["_cloudflare_candidate_id"] = proxy_copy["_cloudflare_candidate_id"]
+            elif (proxy_copy.get("_source") == "cloudflare_subscription"
+                  and retained.get("_source") != "cloudflare_auto"):
+                retained["_source"] = "cloudflare_subscription"
+            for key in ("_source", "_cloudflare_candidate_id"):
+                if key not in retained and key in proxy_copy:
+                    retained[key] = proxy_copy[key]
             continue
-        seen_nodes.add(identity)
+        if "_source_ids" in proxy_copy:
+            proxy_copy["_source_ids"] = proxy_source_ids(proxy_copy)
+        seen_nodes[identity] = proxy_copy
+        normalized.append(proxy_copy)
 
-        base_name = str(proxy_copy.get("name") or "proxy")
+    # Deduplication may discover CF provenance on a later copy of an RSS node.
+    # Assign names only after all source memberships have been merged.
+    for proxy_copy in normalized:
+        base_name = source_proxy_name(proxy_copy)
         name = base_name
         suffix = name_counts.get(base_name, 1)
         while name in used_names:
-            name = f"{base_name}-{suffix}"
+            name = source_proxy_name(proxy_copy, base_name, suffix)
             suffix += 1
         name_counts[base_name] = suffix
         used_names.add(name)
         proxy_copy["name"] = name
-        normalized.append(proxy_copy)
     return normalized
 
 
-def select_export_proxies(proxies, limit=50):
-    selected_indexes = set()
-    required = {"google", "youtube", "chatgpt"}
-    for categories in (required, {"google"}, {"youtube"}, {"chatgpt"}):
-        candidate = next((index for index, proxy in enumerate(proxies)
-                          if categories.issubset(proxy.get("_categories", set()))), None)
-        if candidate is not None and len(selected_indexes) < limit:
-            selected_indexes.add(candidate)
-    for index in range(len(proxies)):
-        if len(selected_indexes) >= limit:
-            break
-        selected_indexes.add(index)
-    return [proxy for index, proxy in enumerate(proxies) if index in selected_indexes]
+def select_export_proxies(proxies, limit=50, policy=None):
+    return select_candidates(proxies, limit, policy)
 
 
 class ClashMetaManager:
@@ -164,11 +249,9 @@ class ClashMetaManager:
         base_config["external-controller"] = f"127.0.0.1:{self.controller_port}"
         base_config["secret"] = self.secret
 
-        proxies = _normalize_proxies(proxies)
-        base_config["proxies"] = [
-            {key: value for key, value in proxy.items() if not key.startswith("_")}
-            for proxy in proxies
-        ]
+        reserved = _reserved_proxy_names(self.base, self.test_template)
+        proxies = _normalize_proxies(proxies, reserved)
+        base_config["proxies"] = materialize_proxies(proxies, reserved)
         proxy_names = [p["name"] for p in proxies]
         # 只将节点加入第一个 select 组（"TEST"），其他组保持原样
         groups = base_config.get("proxy-groups")
@@ -176,20 +259,15 @@ class ClashMetaManager:
             groups[0]["proxies"] = proxy_names
 
         target_path = output_path or self.test
-        target_dir = os.path.dirname(target_path)
-        if target_dir:
-            os.makedirs(target_dir, exist_ok=True)
-
-        with open(target_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(base_config, f, allow_unicode=True)
+        _atomic_write_config(base_config, target_path)
+        return proxies
 
     def start(self, config_path=None):
         """
         启动 Clash 实例，并轮询 API 确认真正就绪（最多等待 30 秒）。
         比固定 time.sleep(5) 更可靠。
         """
-        exe = "linux-compatible" if os.name != "nt" else "windows-compatible.exe"
-        exe_path = os.path.join(BIN_PATH, exe)
+        exe_path = resolve_mihomo_executable()
         target_path = config_path or self.test
 
         self._log_handle = open(self.log_file, "w", encoding="utf-8")
@@ -278,7 +356,7 @@ class ClashMetaManager:
         logger.warning("switch_proxy: 等待节点 %s 生效超时（当前 now=%s）", proxy_name, last_now)
         return False
 
-    def save_config(self, proxies, clash_name, mirror_only=False):
+    def save_config(self, proxies, clash_name, mirror_only=False, policy=None):
         """写出最终配置；``mirror_only=True`` 时只刷新采集缓存，不碰投放文件。
 
         dev 模式需要刷新 clash/proxy_generated.yaml（下次启动靠它借上次的有效
@@ -287,27 +365,24 @@ class ClashMetaManager:
         with open(self.base, "r", encoding="utf-8") as f:
             base_config = yaml.safe_load(f)
 
-        proxies = select_export_proxies(_normalize_proxies(proxies))
-        base_config["proxies"] = [
-            {key: value for key, value in proxy.items() if not key.startswith("_")}
-            for proxy in proxies
-        ]
+        policy = policy or load_node_policy()
+        reserved = _reserved_proxy_names(self.base, self.test_template)
+        proxies = select_export_proxies(_normalize_proxies(proxies, reserved), policy=policy)
+        base_config["proxies"] = materialize_proxies(proxies, reserved)
         groups = base_config.get("proxy-groups")
         if groups is None:
             logger.warning("save_config: base 配置中无 proxy-groups，跳过组更新")
             groups = []
         selection = next((group["name"] for group in groups if "节点选择" in group["name"]), None)
         automatic = next((group["name"] for group in groups if "自动选择" in group["name"]), None)
-        global_names = [proxy["name"] for proxy in proxies
-                if {"google", "youtube", "chatgpt"}.issubset(proxy.get("_categories", set()))]
+        global_names = [proxy["name"] for proxy in preferred_pool(proxies, SERVICES, policy)]
         for group in groups:
             group_type = group.get("type", "")
             group_name = group.get("name", "")
             service = next((service for service in ("google", "youtube", "chatgpt")
                             if service in group_name.lower()), None)
             if service:
-                members = [proxy["name"] for proxy in proxies
-                           if service in proxy.get("_categories", set())]
+                members = [proxy["name"] for proxy in preferred_pool(proxies, (service,), policy)]
                 group["proxies"] = members or ["REJECT"]
                 group["type"] = "url-test" if members else "select"
                 if members:
@@ -346,17 +421,17 @@ class ClashMetaManager:
         global_group["proxies"] = list(dict.fromkeys(
             [name for name in (selection, automatic) if name] + global_names)) or ["REJECT"]
         base_config["proxy-groups"] = groups
+        openvpn_names = {proxy["name"] for proxy in proxies if proxy.get("type") == "openvpn"}
+        for group in groups:
+            if group.get("type") == "url-test" and openvpn_names.intersection(group.get("proxies", [])):
+                group["timeout"] = 35000
         base_config.setdefault("profile", {})["store-selected"] = True
 
         target_path = clash_name
         if not os.path.isabs(target_path) and not os.path.dirname(target_path):
             target_path = os.path.join(BIN_PATH, target_path)
         if not mirror_only:
-            target_dir = os.path.dirname(target_path)
-            if target_dir:
-                os.makedirs(target_dir, exist_ok=True)
-            with open(target_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(base_config, f, allow_unicode=True)
+            _atomic_write_config(base_config, target_path)
 
         # 在 clash/ 下留一份副本，供下一次采集时用真实节点启动本地代理
         # （main.start_proxies 会优先读取它，见 GENERATED_PROXY_CONFIG）。
@@ -364,8 +439,7 @@ class ClashMetaManager:
         mirror_path = os.path.join(BIN_PATH, GENERATED_PROXY_CONFIG)
         if mirror_only or os.path.abspath(mirror_path) != os.path.abspath(target_path):
             try:
-                with open(mirror_path, "w", encoding="utf-8") as f:
-                    yaml.safe_dump(base_config, f, allow_unicode=True)
+                _atomic_write_config(base_config, mirror_path)
                 logger.info("已写入代理配置副本: %s", mirror_path)
             except OSError as e:
                 # 副本只是优化项，写失败不应影响主配置产出

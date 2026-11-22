@@ -159,7 +159,7 @@ class ClashSubscriptionSourceTests(unittest.TestCase):
         with patch("main.load_urls", return_value=[
                 "https://invalid.example/{broken",
                 "https://valid.example/{stamp}.yaml",
-        ]), patch("main.requests.Session", return_value=session):
+        ]), patch("main._subscription_session", return_value=session):
             proxies = get_clash_proxies(use_local_proxy=False)
 
         self.assertEqual([proxy["name"] for proxy in proxies], ["node"])
@@ -260,6 +260,21 @@ class Base64Tests(unittest.TestCase):
 
 
 class ShadowsocksTests(unittest.TestCase):
+    def test_password_punctuation_survives_all_supported_encodings(self):
+        for password in ("pa~ss", "~first", "pa:ss~word@@", "~:@"):
+            for delimiter in (":", "~"):
+                credentials = f"aes-128-gcm{delimiter}{password}"
+                from urllib.parse import quote
+                for body in (f"aes-128-gcm{delimiter}{quote(password, safe='')}@192.0.2.1:443",
+                             f"{urlsafe_b64(credentials)}@192.0.2.1:443",
+                             urlsafe_b64(credentials + "@192.0.2.1:443")):
+                    with self.subTest(password=password, delimiter=delimiter, body=body):
+                        proxy = decode_ss(f"ss://{body}#test")
+                        self.assertEqual(proxy["cipher"], "aes-128-gcm")
+                        self.assertEqual(proxy["password"], password)
+                        self.assertEqual(proxy["server"], "192.0.2.1")
+                        self.assertEqual(proxy["port"], 443)
+
     def test_legacy_padded_link(self):
         userinfo = base64.b64encode(b"aes-128-gcm:pass").decode()
         node = decode_ss(f"ss://{userinfo}@1.2.3.4:8388#legacy")

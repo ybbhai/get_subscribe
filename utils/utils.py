@@ -7,20 +7,31 @@ import logging
 import os
 import re
 import ssl
+import threading
 import time
 import urllib.parse
+from collections import Counter
+from time import monotonic
 from typing import Optional, Tuple, List
 
 import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
 
-from utils.clash_manager import ClashMetaManager, _normalize_proxies, select_export_proxies, find_free_port_block
+from utils.clash_manager import ClashMetaManager, _normalize_proxies, select_export_proxies, find_free_port_block, supports_openvpn
+from utils.proxy_chain import DEPENDENCIES_KEY
+from utils.exit_quality import ExitInspector, unknown
+from utils.node_policy import (load_node_policy, rank_proxies, quality_tier, TIER_LABELS,
+                               meets_performance_floor, select_inspection_candidates)
+from utils.selection_report import write_selection_report
+from utils.source_tracking import proxy_source_ids, stage_counts
 
 logger = logging.getLogger(__name__)
 
 # 批量测速 worker 的端口窗口起点；每个 worker 独占 20 个端口，避免互相抢占
 _WORKER_PORT_BASE = 18000
+# Do not make the bulk downloads compete with each other on this machine.
+_DOWNLOAD_LOCK = threading.Lock()
 
 
 def b64_decode_text(raw: str) -> Optional[str]:
@@ -255,7 +266,7 @@ def decode_ss(link):
         # 百分号编码的明文 method:password。base64 字母表不含 ":"，
         # 因此用是否含 ":" 即可无歧义地区分两种写法。
         userinfo, hostport = raw.rsplit("@", 1)
-        if ":" in userinfo:
+        if ":" in userinfo or "~" in userinfo:
             credentials = urllib.parse.unquote(userinfo)
         else:
             credentials = b64_decode_text(userinfo)
@@ -269,19 +280,14 @@ def decode_ss(link):
             logger.debug("ss 节点 base64 解码失败")
             return None
 
-    # 标准格式：method:password@host:port；新规范：method~password@host:port（~ 开头是加密口令）
+    # 先分离地址，再按第一个凭据分隔符拆分；口令中的 :、~、@ 都必须保留。
     try:
-        if "~" in decoded:
-            method, rest = decoded.split("~", 1)
-        else:
-            method, rest = decoded.split(":", 1)
         if hostport is not None:
-            # SIP002 已经把 host:port 拆出来了，口令里再出现 "@" 也不会污染地址
-            password, server = rest, hostport
+            credentials, server = decoded, hostport
         else:
-            # 旧式整串 base64 时口令本身可能含 "@"（如 qwerREWQ@@），
-            # 必须从右侧 rsplit，否则 server 会变成 "@@1.2.3.4"
-            password, server = rest.rsplit("@", 1)
+            credentials, server = decoded.rsplit("@", 1)
+        # 保留旧订阅的 method~password 兼容格式，标准 method:password 优先。
+        method, password = re.split(r"[:~]", credentials, maxsplit=1)
         host, port = server.rsplit(":", 1)
         proxy = {
             "name": name,
@@ -395,7 +401,8 @@ async def test_links_concurrent(
     semaphore = asyncio.Semaphore(max_concurrent)
     connector = aiohttp.TCPConnector(limit=max_concurrent)
 
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(
+            connector=connector, trust_env=False) as session:
         async def limited_test(link):
             async with semaphore:
                 return await test_link_async(session, link, proxies, timeout)
@@ -454,6 +461,10 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
     接收已有的 http_port，构建代理后并发请求 4 个测试目标。
     """
     timeout = max(timeout, 6)
+    is_openvpn = node.get("type") == "openvpn"
+    if is_openvpn:
+        # Native OpenVPN and CFnew chains need time for the shared handshake.
+        timeout = max(timeout, 35)
     proxies = {
         "http": f"http://127.0.0.1:{http_port}",
         "https": f"http://127.0.0.1:{http_port}",
@@ -478,6 +489,7 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
         "chatgpt_speed_kbps": 0,
         "github_speed_kbps": 0,
         "avg_latency": None,
+        "service_avg_latency": None,
         "avg_speed_kbps": 0,
         "health_check_passed": False,
         "download_passed": False,
@@ -485,12 +497,41 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
     }
 
     try:
-        raw_results = await test_links_concurrent(
-            [url for _, url in test_links],
-            proxies,
-            timeout=timeout,
-            max_concurrent=5
-        )
+        if is_openvpn:
+            # Mihomo may return a short dial timeout while its independent
+            # 30s OpenVPN handshake is still running. Keep this same node
+            # selected and retry service probes within one 35s readiness budget.
+            # The outer deadline also prevents aiohttp timeout rounding from
+            # extending a late retry beyond the shared budget.
+            deadline = monotonic() + 35
+            service_urls = {url for service, url in test_links if service != "github"}
+            raw_results = []
+            while True:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    raw_results = await asyncio.wait_for(
+                        test_links_concurrent([url for _, url in test_links], proxies,
+                                              timeout=remaining, max_concurrent=5),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    break
+                if any(success and link in service_urls for link, success, _, _ in raw_results):
+                    break
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                # Failed HTTP dials may return immediately; avoid a busy loop.
+                await asyncio.sleep(min(0.25, remaining))
+        else:
+            raw_results = await test_links_concurrent(
+                [url for _, url in test_links],
+                proxies,
+                timeout=timeout,
+                max_concurrent=5
+            )
 
         # 防御：若上游 test_links_concurrent 因内部异常返回不足 4 项，记录并跳过
         if len(raw_results) != len(test_links):
@@ -508,7 +549,7 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
         # 计算平均延时和速度
         latencies = [results[f"{s}_latency"] for s in ["google", "youtube", "chatgpt", "github"] if results.get(f"{s}_latency")]
         if latencies:
-            results["avg_latency"] = round(sum(latencies) / len(latencies), 1)
+            results["service_avg_latency"] = round(sum(latencies) / len(latencies), 1)
         service_available = any(results.get(f"{s}_latency") is not None for s in ["google", "youtube", "chatgpt"])
         results["is_available"] = service_available
         if service_available:
@@ -517,11 +558,26 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
                 proxies, timeout=timeout, max_concurrent=1
             )
             results["health_check_passed"] = any(success for _, success, _, _ in health_results)
+            for _, success, elapsed, _ in health_results:
+                if success:
+                    results["avg_latency"] = round(elapsed * 1000, 1)
+                    break
+            if results["avg_latency"] is None:
+                # Both endpoints are empty-body probes. A full page download is
+                # not comparable latency evidence and must not be substituted.
+                results["avg_latency"] = results["google_latency"]
         if service_available:
-            speed_results = await test_links_concurrent(
-                ["https://speed.cloudflare.com/__down?bytes=1048576"],
-                proxies, timeout=timeout, max_concurrent=1
-            )
+            # Acquire without blocking an event loop; concurrent workers share
+            # one bulk-transfer slot. The request deadline excludes queue time.
+            while not _DOWNLOAD_LOCK.acquire(blocking=False):
+                await asyncio.sleep(0.05)
+            try:
+                speed_results = await test_links_concurrent(
+                    ["https://speed.cloudflare.com/__down?bytes=1048576"],
+                    proxies, timeout=timeout, max_concurrent=1
+                )
+            finally:
+                _DOWNLOAD_LOCK.release()
             for _, success, elapsed, downloaded_bytes in speed_results:
                 if success and elapsed > 0 and downloaded_bytes == 1024 * 1024:
                     results["download_passed"] = True
@@ -533,13 +589,20 @@ async def _test_node_metrics_async(node, http_port, timeout=6):
     return results
 
 
+def requires_tcp_probe(proxy):
+    """Only a direct TCP dial is meaningful for these candidate transports."""
+    return not ((proxy.get("dialer-proxy") and proxy.get(DEPENDENCIES_KEY))
+                or str(proxy.get("type", "")).lower() in ("hysteria", "hysteria2", "tuic", "openvpn"))
+
+
 async def test_proxy_telnet_async(proxy, timeout=5):
     """异步 TCP 连接测试，利用 Linux epoll 提高并发效率"""
     server = proxy.get("server", "")
     port = proxy.get("port")
     if not server or port is None:
         return None
-    if proxy.get("type", "").lower() in ("hysteria", "hysteria2", "tuic"):
+    if not requires_tcp_probe(proxy):
+        # These paths still require an actual protocol/service test afterwards.
         return proxy
     host = server.strip('[]')
     try:
@@ -579,7 +642,27 @@ async def test_proxies_async(proxies, timeout=5, max_concurrent=200):
     return results
 
 
-def _test_batch_nodes(batch_proxies, dirs, timeout, worker_id):
+class _ProbeAudit:
+    """Only aggregate stages/reasons; never store proxy credentials or core logs."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counts = Counter()
+
+    def record(self, nodes, phase, reason):
+        with self._lock:
+            for node in nodes:
+                for source in proxy_source_ids(node):
+                    self._counts[(source, phase, reason)] += 1
+
+    def snapshot(self):
+        with self._lock:
+            return [{"source": source, "phase": phase, "reason": reason, "count": count}
+                    for (source, phase, reason), count in sorted(self._counts.items())]
+
+
+def _test_batch_nodes(batch_proxies, dirs, timeout, worker_id, inspector=None,
+                      mode="full", policy=None, audit=None):
     """批量测试：一个 Clash 实例同时测试多个节点，并记录性能指标"""
     # 端口不能写死：用户本机开着代理客户端时 7890/7891/9090 基本都被占用，
     # 采集实例绑定失败会让整批节点测试直接作废（表现为 0 个可用节点）。
@@ -587,12 +670,14 @@ def _test_batch_nodes(batch_proxies, dirs, timeout, worker_id):
     window_start = _WORKER_PORT_BASE + worker_id * 20
     window_stop = window_start + 20
     http_port, socks_port = find_free_port_block(
-        size=2, start=window_start, stop=window_stop)
+        size=2, start=window_start, stop=window_start + 10, step=1)
     # mixed（HTTP 与 SOCKS 共用）之外的 controller 需要单独一段
     controller_port, _ = find_free_port_block(
-        size=1, start=window_start + 10, stop=window_stop)
+        size=1, start=window_start + 10, stop=window_stop, step=1)
     if http_port is None or controller_port is None:
         logger.error("worker %d 找不到空闲端口，跳过该批次", worker_id)
+        if audit:
+            audit.record(batch_proxies, mode, "ports_unavailable")
         return []
     config_name = f"clash_test_{worker_id}.yaml"
     log_name = f"clash_test_{worker_id}.log"
@@ -609,10 +694,14 @@ def _test_batch_nodes(batch_proxies, dirs, timeout, worker_id):
     )
 
     metrics_results = []
+    started = False
+    split_failed_batch = False
+    policy = policy or load_node_policy()
 
     try:
         manager.write_config(batch_proxies, output_path=config_path)
         manager.start(config_path=config_path)
+        started = True
 
         # 对每个节点：先通过 Clash API 切换到该节点，再测性能
         for node in batch_proxies:
@@ -620,6 +709,8 @@ def _test_batch_nodes(batch_proxies, dirs, timeout, worker_id):
             # 切换到当前测试的节点（必须，否则测的是默认选中节点）
             if not manager.switch_proxy(node_name):
                 logger.warning("切换代理 %s 失败，跳过", node_name)
+                if audit:
+                    audit.record([node], mode, "switch_failed")
                 continue
 
             node_metrics = test_node_metrics(node, http_port, timeout)
@@ -629,23 +720,52 @@ def _test_batch_nodes(batch_proxies, dirs, timeout, worker_id):
                 # 清理节点名称中的 Unicode 编码
                 proxy_copy["name"] = decode_unicode_name(proxy_copy.get("name", ""))
                 # 附加性能指标（仅在有有效数据时写入，避免 None 导致排序崩溃）
-                if node_metrics["avg_latency"] is not None:
-                    proxy_copy["_latency"] = node_metrics["avg_latency"]
+                proxy_copy["_latency"] = node_metrics["avg_latency"]
                 proxy_copy["_speed_kbps"] = node_metrics["avg_speed_kbps"]
+                proxy_copy["_download_passed"] = node_metrics.get("download_passed") is True
+                proxy_copy["_service_latency_ms"] = {
+                    service: node_metrics.get(f"{service}_latency")
+                    for service in ("google", "youtube", "chatgpt", "github")
+                }
                 proxy_copy["_categories"] = {
                     service for service in ("google", "youtube", "chatgpt")
                     if node_metrics[f"{service}_latency"] is not None
                 }
+                if mode == "verify":
+                    # Only services working on both passes receive group access.
+                    proxy_copy["_categories"].intersection_update(node.get("_categories", ()))
+                eligible = meets_performance_floor(proxy_copy, policy) and bool(proxy_copy["_categories"])
+                proxy_copy["_exit_quality"] = unknown("awaiting_inspection" if eligible else "performance_floor")
+                if mode == "verify":
+                    proxy_copy["_verification"] = "passed" if eligible else "failed"
+                elif mode == "measure":
+                    proxy_copy["_verification"] = "pending"
+                # TEST still points at this exact node, including its dialer chain.
+                if mode == "full" or (mode == "verify" and eligible):
+                    try:
+                        inspector = inspector or ExitInspector(policy)
+                        proxy_copy["_exit_quality"] = inspector.inspect(http_port)
+                    except Exception as error:
+                        logger.warning("出口属性查询失败（%s），保留服务实测结果", type(error).__name__)
+                        proxy_copy["_exit_quality"] = unknown("lookup_failed")
+                if audit and not eligible:
+                    audit.record([node], mode, "performance_floor")
                 metrics_results.append(proxy_copy)
                 logger.debug("  -> %s: OK (延迟: %sms, 速度: %.0fkbit/s)",
                              proxy_copy["name"], node_metrics["avg_latency"], node_metrics["avg_speed_kbps"])
             else:
                 logger.debug("  -> %s: FAIL", node.get("name", "unknown"))
-
-        return metrics_results
+                if audit:
+                    audit.record([node], mode, "service_failed")
     except Exception as e:
-        logger.error("Batch test failed (worker_id=%d): %s", worker_id, e)
-        return []
+        logger.error("Batch test failed (worker_id=%d): %s", worker_id, type(e).__name__)
+        # A malformed proxy must not invalidate the other 19 candidates. Only
+        # retry early parse/exit errors; timeouts and missing binaries are global.
+        split_failed_batch = (not started and len(batch_proxies) > 1
+                              and isinstance(e, (ValueError, RuntimeError)))
+        if audit:
+            audit.record(batch_proxies, mode, "batch_split" if split_failed_batch else
+                         "batch_start_failed" if not started else "batch_runtime_failed")
     finally:
         manager.stop()
         for path in (config_path, log_path):
@@ -654,61 +774,49 @@ def _test_batch_nodes(batch_proxies, dirs, timeout, worker_id):
                     os.remove(path)
                 except Exception:
                     pass
+    if split_failed_batch:
+        middle = len(batch_proxies) // 2
+        for part in (batch_proxies[:middle], batch_proxies[middle:]):
+            metrics_results.extend(_test_batch_nodes(
+                part, dirs, timeout, worker_id, inspector, mode, policy, audit))
+    return metrics_results
 
 
-# 归一化基准：延迟 0ms 得满分，达到或超过 1000ms 记 0 分；速度 10Mbps 记满分
-_LATENCY_REFERENCE_MS = 1000.0
-_SPEED_REFERENCE_KBPS = 10000.0
+def sort_proxies_by_performance(proxies, policy=None):
+    """Rank quality tiers first, then latency and download speed within each tier."""
+    return rank_proxies(proxies or [], policy)
 
 
-def sort_proxies_by_performance(proxies):
-    """
-    根据性能指标对节点进行排序
-    优先选择延迟低、速度快的节点
-    同时考虑节点的服务类别匹配
-
-    评分公式：latency_score * 0.7 + speed_score * 0.3 + 类别加分，
-    其中两项分数均已归一化到 0-100。
-    """
+def _run_probe_batches(proxies, dirs, timeout, inspector, policy, audit, mode, workers):
     if not proxies:
         return []
-
-    def proxy_sort_key(proxy):
-        # 获取性能指标，默认值表示无数据
-        latency = proxy.get("_latency")
-        speed = proxy.get("_speed_kbps", 0) or 0
-        categories = proxy.get("_categories", set())
-
-        # 没有有效延迟数据，排在最后
-        if latency is None:
-            return (float("inf"), 0, 0)
-
-        # 评分：低延迟和高速度都有益
-        # 两项都必须先归一化到同一量纲（0-100），否则权重没有实际意义。
-        # 原实现 latency_score = 1000/(latency+1) 在真实 100~600ms 区间只有 1.6~10，
-        # 而 speed_score 很容易顶到上限 100，结果速度完全主导排序，与注释声明的 0.7 相反。
-        latency_score = max(0.0, 100.0 * (1 - latency / _LATENCY_REFERENCE_MS))
-        speed_score = min(100.0 * speed / _SPEED_REFERENCE_KBPS, 100.0)
-
-        # 综合评分（越大越好：低延迟 + 高速度）
-        total_score = latency_score * 0.7 + speed_score * 0.3
-
-        # 特殊服务加分（类别越多越优先）
-        category_bonus = len(categories) * 5
-
-        # 排序键（升序，键越小越靠前）：
-        # -total_score   → 总评分越高越靠前
-        # -category_bonus→ 匹配类别越多越靠前
-        # latency        → 延迟越低越靠前（最终 tie-breaker）
-        return (-total_score, -category_bonus, latency)
-
-    # 按评分排序
-    sorted_proxies = sorted(proxies, key=proxy_sort_key)
-
-    return sorted_proxies
+    batches = [proxies[i:i + 20] for i in range(0, len(proxies), 20)]
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
+        future_map = {
+            executor.submit(_test_batch_nodes, batch, dirs, timeout, worker_id,
+                            inspector, mode, policy, audit): (worker_id, batch)
+            for worker_id, batch in enumerate(batches)
+        }
+        completed = 0
+        for future in concurrent.futures.as_completed(future_map):
+            worker_id, batch = future_map[future]
+            completed += len(batch)
+            try:
+                results.extend(future.result())
+            except Exception as error:
+                audit.record(batch, mode, "worker_failed")
+                logger.error("Batch test error (worker_id=%d): %s", worker_id, type(error).__name__)
+            logger.info("%s 已测试 %d/%d 个节点，服务可用: %d（worker_id=%d）",
+                        mode, completed, len(proxies), len(results), worker_id)
+    return results
 
 
-def test_nodes(proxies, env, dirs, timeout=6):
+def _stage_counts(proxies):
+    return stage_counts(proxies)
+
+
+def test_nodes(proxies, env, dirs, timeout=6, diagnostics=None):
     """
     批量测试节点，并发启动多个 Clash 实例。
 
@@ -720,81 +828,115 @@ def test_nodes(proxies, env, dirs, timeout=6):
       不能写死 7890/7891/9090，本机代理客户端通常已占用这些端口
     - 同一批内所有节点共享同一个 Clash 实例，通过 proxy-groups 切换测试
     """
+    policy = load_node_policy(profile=env)
+    inspector = ExitInspector(policy, profile=env)
+    diagnostics = dict(diagnostics or {})
+    diagnostics["profile"] = env
+    stages = diagnostics.setdefault("stage_counts", {})
+    stages["test_input"] = _stage_counts(proxies)
+    audit = _ProbeAudit()
+    status = inspector.capabilities()
+    if status["enabled"] and not status["available"]:
+        logger.warning("家宽识别模式已自动开启，但未配置 IPAPI_IS_KEY 或 config/exit_quality.yaml；"
+                       "本轮仅检测低风险，家宽属性保持未知")
+    logger.info("节点性能门槛：完整下载 >= %.0f kbit/s，204 响应耗时 <= %.0fms",
+                policy.min_speed_kbps, policy.max_latency_ms)
     if not proxies:
+        write_selection_report([], [], policy, dirs, diagnostics=diagnostics, inspection=status)
         return []
 
-    # Clash 要求代理名称唯一；解码后再分配名称，避免转义名称产生碰撞。
-    used_names = set()
-    name_counts = {}
-    normalized_proxies = []
-    for proxy in proxies:
-        proxy_copy = dict(proxy)
-        base_name = decode_unicode_name(proxy_copy.get("name", "")) or "proxy"
-        name = base_name
-        suffix = name_counts.get(base_name, 1)
-        while name in used_names:
-            name = f"{base_name}-{suffix}"
-            suffix += 1
-        name_counts[base_name] = suffix
-        used_names.add(name)
-        proxy_copy["name"] = name
-        normalized_proxies.append(proxy_copy)
-    proxies = normalized_proxies
+    if any(proxy.get("type") == "openvpn" for proxy in proxies) and not supports_openvpn():
+        logger.warning("跳过 OpenVPN 候选：完整配置字段需要 Mihomo >= 1.19.30；请查看 openvpn_runtime 诊断或设置 MIHOMO_BINARY")
+        audit.record([proxy for proxy in proxies if proxy.get("type") == "openvpn"],
+                     "measure", "unsupported_core")
+        proxies = [proxy for proxy in proxies if proxy.get("type") != "openvpn"]
+        if not proxies:
+            diagnostics["probe_failures"] = audit.snapshot()
+            write_selection_report([], [], policy, dirs, diagnostics=diagnostics, inspection=status)
+            return []
+
+    # Match runtime/export normalization so switch_proxy uses the actual name,
+    # including when callers supply duplicate RSS/CF routes directly.
+    proxies = _normalize_proxies([
+        dict(proxy, name=decode_unicode_name(proxy.get("name", "")) or "proxy")
+        for proxy in proxies
+    ])
 
     logger.info("开始批量测试节点（并发启动多个 Clash 实例）...")
     start_time = time.time()
 
-    # 每批测试数量（一个 Clash 实例可同时处理多个节点）
-    batch_size = 20
-
-    # 将节点均分为多个 batch
-    batches = [proxies[i:i + batch_size] for i in range(0, len(proxies), batch_size)]
-    # 最大并发 worker 数 = 实际 batch 数（不超过 8）
-    worker_count = min(8, len(batches))
-    results = []
-
-    # 使用线程池并发处理各 batch，每个 batch 对应 1 个 worker（1 个 Clash 实例）
-    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_map = {
-            executor.submit(_test_batch_nodes, batch, dirs, timeout, worker_id): (worker_id, batch)
-            for worker_id, batch in enumerate(batches)
-        }
-
-        completed = 0
-        for future in concurrent.futures.as_completed(future_map):
-            worker_id, batch = future_map[future]
-            completed += len(batch)
-            try:
-                alive_nodes = future.result()
-                results.extend(alive_nodes)
-            except Exception as e:
-                logger.error("Batch test error (worker_id=%d): %s", worker_id, e)
-            logger.info("已测试 %d/%d 个节点，可用节点: %d（worker_id=%d）",
-                        completed, len(proxies), len(results), worker_id)
+    mode = "measure" if env == "prod" else "full"
+    results = _run_probe_batches(proxies, dirs, timeout, inspector, policy, audit,
+                                mode, 4 if env == "prod" else 8)
+    stages["service_passed"] = _stage_counts(results)
+    stages["performance_passed"] = _stage_counts([
+        p for p in results if meets_performance_floor(p, policy)])
+    measured_results = results
+    if env == "prod":
+        for proxy in measured_results:
+            proxy["_verification"] = "not_selected"
+            proxy["_exit_quality"] = unknown("round_lookup_budget" if meets_performance_floor(proxy, policy)
+                                            else "performance_floor")
+        remaining = list(results)
+        attempted = []
+        verified = []
+        results = []
+        while remaining and len(results) < policy.max_lookups_per_round:
+            candidates = select_inspection_candidates(
+                remaining, policy.max_lookups_per_round - len(results), policy)
+            if not candidates:
+                break
+            candidate_names = {p["name"] for p in candidates}
+            remaining = [p for p in remaining if p["name"] not in candidate_names]
+            attempted.extend(candidates)
+            for proxy in candidates:
+                proxy["_verification"] = "failed"
+                proxy["_exit_quality"] = unknown("verification_failed")
+            logger.info("prod 复测性能最优候选 %d 个，再查询出口；未复测通过的候选不导出", len(candidates))
+            wave = _run_probe_batches(candidates, dirs, timeout, inspector, policy, audit, "verify", 4)
+            verified.extend(wave)
+            results.extend(p for p in wave if p.get("_verification") == "passed")
+            # Failed rechecks did not spend an exit lookup. Fill those slots
+            # from the next qualified candidates instead of wasting the budget.
+        replacements = {p["name"]: p for p in verified}
+        measured_results = [replacements.get(p["name"], p) for p in measured_results]
+        stages["verification_candidates"] = _stage_counts(attempted)
+        stages["verification_passed"] = _stage_counts(results)
+        stages["exit_checked"] = _stage_counts(results)
 
     total_time = time.time() - start_time
     logger.info("批量测试完成，总耗时: %.2f 秒", total_time)
     logger.info("成功节点: %d/%d", len(results), len(proxies))
 
-    # 按性能排序
+    # 每个服务分别选择最优的可用等级，再在等级内按性能排序。
     if results:
-        results = select_export_proxies(sort_proxies_by_performance(results))
-        logger.info("节点已按性能排序（延迟低、速度快的在前）")
+        results = select_export_proxies(rank_proxies(results, policy), policy=policy)
+        for tier, label in TIER_LABELS.items():
+            logger.info("%s：实测 %d，保留 %d", label,
+                        sum(quality_tier(p, policy) == tier for p in measured_results),
+                        sum(quality_tier(p, policy) == tier for p in results))
+    stages["selected"] = _stage_counts(results)
+    diagnostics["probe_failures"] = audit.snapshot()
+    write_selection_report(measured_results, results, policy, dirs,
+                           diagnostics=diagnostics, inspection=inspector.capabilities())
 
     if results:
         manager = ClashMetaManager('base_template.yaml', 'test_config.yaml')
         if env != "dev":
-            manager.save_config(results, os.path.join(dirs, "clash.yaml"))
+            manager.save_config(results, os.path.join(dirs, "clash.yaml"), policy=policy)
         else:
             # dev 模式不覆盖投放文件，但必须刷新 clash/proxy_generated.yaml：
             # 下次启动要靠它借上次的有效节点访问被墙的订阅源。
             # 不刷新的话缓存永远停在占位配置上，本地反复运行也只能直连。
             manager.save_config(results, os.path.join(dirs, "clash.yaml"),
-                                mirror_only=True)
+                                mirror_only=True, policy=policy)
             logger.warning(
                 "当前为 dev 环境，未写入 %s；已刷新采集缓存，如需导出请使用 -p prod",
                 os.path.join(dirs, "clash.yaml"),
             )
+    elif env == "prod":
+        logger.warning("本轮没有通过性能与复测要求的节点，未生成新 clash.yaml；"
+                       "若目录已有旧文件，它不代表本轮结果，请查看 node_selection_report.json")
 
     return results
 

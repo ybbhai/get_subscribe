@@ -56,6 +56,25 @@ class LocalApiSessionTests(unittest.TestCase):
 
 
 class PortAllocationTests(unittest.TestCase):
+    def test_allocator_never_crosses_exclusive_window_end(self):
+        with patch("utils.clash_manager._is_port_free", return_value=True) as check:
+            self.assertEqual(find_free_port_block(size=2, start=40000, stop=40001), (None, None))
+        check.assert_not_called()
+
+    def test_busy_worker_first_port_cannot_make_http_overlap_controller(self):
+        from utils import utils as utils_module
+        manager = MagicMock()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(utils_module, "_WORKER_PORT_BASE", 40000), \
+                patch("utils.clash_manager._is_port_free", side_effect=lambda port: port != 40000), \
+                patch.object(utils_module, "ClashMetaManager", return_value=manager) as factory, \
+                patch.object(utils_module, "test_node_metrics", return_value={"is_available": False}):
+            utils_module._test_batch_nodes([{"name": "node"}], directory, 1, 0)
+        ports = factory.call_args.kwargs
+        self.assertEqual(len({ports["http_port"], ports["socks_port"], ports["controller_port"]}), 3)
+        self.assertLess(ports["socks_port"], 40010)
+        self.assertGreaterEqual(ports["controller_port"], 40010)
+
     @unittest.skipUnless(_socket_creation_allowed(), "environment forbids socket creation")
     def test_batch_ports_do_not_collide_with_busy_ports(self):
         """7890/9090 被本机代理占用时，必须换到别的端口区间。"""

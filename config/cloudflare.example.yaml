@@ -1,0 +1,26 @@
+# 复制为 cloudflare.yaml；真实订阅 URL 可能含 UUID/令牌，请勿提交。
+# 相对文件路径相对 cloudflare.yaml 所在目录解析，适用于 Windows 与 Linux。
+automatic_enabled: true
+automatic_max_candidates: 40
+max_total_candidates: 500
+
+# 最多 32 个来源，id 为不含 URL 的短标识；每源可设置 1–500 个候选。
+# 每源只能设置 subscription_url 或 subscription_file 中的一项。
+# gate 的 nodes.txt 含出口链接，不是最终订阅，也不能作为 addresses_file。
+# gate / CheckSocks5 需先交给 EdgeTunnel 生成最终 URI、Base64 或 Clash YAML。
+sources:
+  - id: gate-edgetunnel
+    enabled: false
+    subscription_url: https://worker.example/replace-with-your-final-subscription
+    max_candidates: 100
+  - id: cfnew-home
+    enabled: false
+    subscription_url: https://cfnew.example/replace-with-your-uuid/sub?target=vg
+    max_candidates: 100
+
+# 不填写 enabled 时由运行环境决定：prod 自动开启，其他环境默认关闭。
+# 可设置 enabled: false 关闭，或 enabled: true 在其他环境启用。
+# api_url 可覆盖 API 地址；mirror_urls 可配置最多 3 个 HTTP(S) 镜像地址。
+vpngate:
+  max_candidates: 100
+  mirror_urls: []
